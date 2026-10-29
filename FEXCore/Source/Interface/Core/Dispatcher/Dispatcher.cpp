@@ -300,8 +300,14 @@ void Dispatcher::EmitDispatcher() {
     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
     // Trigger segfault if any deferred signals are pending
-    strb(ARMEmitter::XReg::zr, STATE,
-         offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+    constexpr auto InterruptFaultOffset =
+      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    if constexpr (InterruptFaultOffset <= 4095) {
+      strb(ARMEmitter::WReg::zr, STATE, InterruptFaultOffset);
+    } else {
+      add(ARMEmitter::Size::i64Bit, TMP2, STATE, static_cast<uint32_t>(InterruptFaultOffset));
+      strb(ARMEmitter::WReg::zr, TMP2, 0);
+    }
 #endif
   };
 
