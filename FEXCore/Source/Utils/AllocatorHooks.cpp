@@ -239,10 +239,24 @@ size_t malloc_usable_size(void* ptr) {
 #endif
 }
 void* aligned_alloc(size_t a, size_t s) {
-  return ::aligned_alloc(a, s);
+  if (s == 0) return nullptr;
+  if (a <= 16) {
+    return ::malloc(s);
+  }
+  size_t alignment = sizeof(void*);
+  while (alignment < a) {
+    alignment <<= 1;
+  }
+  void* ptr = nullptr;
+  if (::posix_memalign(&ptr, alignment, s) == 0) {
+    return ptr;
+  }
+  return nullptr;
 }
 void aligned_free(void* ptr) {
-  return ::free(ptr);
+  if (ptr) {
+    ::free(ptr);
+  }
 }
 
 void SetupAllocatorHooks(mmap_hook_type MMapHook, munmap_hook_type MunmapHook) {}

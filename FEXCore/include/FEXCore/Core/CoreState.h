@@ -159,7 +159,12 @@ struct alignas(64) CPUState {
 
   static gdt_segment* GetSegmentFromIndex(CPUState& State, uint16_t Selector) {
     auto base = State.segment_arrays[(Selector >> 2) & 1];
-    return &base[Selector >> 3];
+    if (!base) {
+      State.segment_arrays[0] = &State.private_gdt[0];
+      State.segment_arrays[1] = &State.private_gdt[0];
+      base = &State.private_gdt[0];
+    }
+    return &base[(Selector >> 3) & 0x1f];
   }
 
   static uint32_t CalculateGDTBase(gdt_segment GDT) {
@@ -239,6 +244,15 @@ struct alignas(64) CPUState {
     // Default mxcsr value
     // All exception masks enabled.
     mxcsr = 0x1F80;
+
+    segment_arrays[SEGMENT_ARRAY_INDEX_GDT] = &private_gdt[0];
+    segment_arrays[SEGMENT_ARRAY_INDEX_LDT] = &private_gdt[0];
+    cs_idx = 0;
+    cs_cached = 0;
+    for (auto& seg : private_gdt) {
+      seg.L = 1; // Default to 64-bit Long Mode
+      seg.D = 0;
+    }
   }
 
   // TODO: This should be moved to the frontend.

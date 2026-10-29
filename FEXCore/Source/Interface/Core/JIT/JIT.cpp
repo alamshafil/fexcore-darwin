@@ -576,7 +576,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   if (TraceThisCall) {
     char trace_thread_name[64] = {};
     pthread_getname_np(pthread_self(), trace_thread_name, sizeof(trace_thread_name));
-    LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: enter thread='{}' Record={:#x} Record->HostCode={:#x} "
+    LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: enter thread='{}' Record={:#x} Record->HostCode={:#x} "
                       "Record->CallerOffset={} TFSet={}",
                       trace_thread_name, reinterpret_cast<uintptr_t>(Record), Record->HostCode, Record->CallerOffset, TFSet);
   }
@@ -585,16 +585,11 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     // If TF is set, the cache must be skipped as different code needs to be generated.
     Frame->State.rip = GuestRip;
     if (TraceThisCall) {
-      LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: return(TFSet) DispatcherLoopTop={:#x}", Frame->Pointers.DispatcherLoopTop);
+      LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: return(TFSet) DispatcherLoopTop={:#x}", Frame->Pointers.DispatcherLoopTop);
     }
     return Frame->Pointers.DispatcherLoopTop;
   } else {
-    {
-      // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
-      auto lk_inval =
-        GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
-      HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
-    }
+    HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
     if (!HostCode) {
       // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
@@ -614,7 +609,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
               ->load(std::memory_order_acquire);
         }
         if (TraceThisCall) {
-          LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: return(buffer-swap) HostCode={:#x} "
+          LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: return(buffer-swap) HostCode={:#x} "
                             "IsAddressInCodeBuffer={}",
                             HostCode, static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode));
         }
@@ -624,7 +619,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   }
 
   if (TraceThisCall) {
-    LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: post-lookup HostCode={:#x} IsAddressInCodeBuffer={}", HostCode,
+    LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: post-lookup HostCode={:#x} IsAddressInCodeBuffer={}", HostCode,
                       HostCode != 0 ? static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode) : false);
   }
 
@@ -647,30 +642,17 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
   ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
 
-  // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
-  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+  // Re-validate HostCode from lookup cache
+  uintptr_t Current = Thread->LookupCache->FindBlock(Thread, GuestRip);
 
-  // Re-validate HostCode now that we hold CodeInvalidationMutex again -- it was captured earlier
-  // (either FindBlock's fast-path hit above, or CompileBlock's return value on the slow path)
-  // while that lock was held only briefly, and an iOS reuse-in-place cycle (NewCodeBuffer=false)
-  // could have run entirely within the gap since then. Unlike a NewCodeBuffer=true reuse,
-  // reuse-in-place clears BlockList/BlockLinks without swapping the LookupCache object itself,
-  // so it's invisible to the "Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()" check
-  // the slow path already does above. Worse, neither that check nor the safepoint mechanism
-  // protects a value already captured into this function's own HostCode local: a thread can be
-  // safepoint-paused *after* reading a since-invalidated HostCode but *before* ever writing it
-  // anywhere, and on resume it has no way to know the value it's still holding went stale while
-  // it was frozen -- the pause only ever protected memory, not a local variable already sitting
-  // in a register. Confirmed on-device as the remaining source of the exact same
-  // "instruction-fetch fault, not inside any currently-live JIT allocation" crash even after the
-  // safepoint's own hold window and CodeInvalidationMutex acquisition ordering were separately
-  // fixed. A fresh FindBlock() here is cheap insurance (this must run before AcquireWriteLock()
-  // below -- FindBlock takes its own read lock on the same underlying mutex GuestToHostMap::Lock,
-  // which would deadlock against that write lock from this same thread); if it disagrees with
-  // what we're still holding, re-resolve properly instead of patching a branch to a target
-  // that's already gone.
-  if (auto Current = Thread->LookupCache->FindBlock(Thread, GuestRip); Current != HostCode) {
-    HostCode = Current ? Current : static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+  if (Current != HostCode) {
+    if (Current != 0) {
+      HostCode = Current;
+    } else {
+      // Must NOT hold CodeInvalidationMutex when calling CompileBlock (CompileBlock acquires it internally
+      // and may need to upgrade to exclusive lock for buffer reuse).
+      HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+    }
     BranchOffset = HostCode / 4 - CallerAddress / 4;
   }
 
@@ -764,10 +746,14 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   // mechanism entirely. Logging the exact value right here, at the one point closest to its
   // computation, settles which.
   if (GuestRip == 0x70007b9cf0ULL) {
-    LogMan::Msg::EFmt("BACHATA_EXITFUNCTIONLINK_TARGET: GuestRip={:#x} HostCode={:#x} TFSet={} "
+    LogMan::Msg::EFmt("KYTY_EXITFUNCTIONLINK_TARGET: GuestRip={:#x} HostCode={:#x} TFSet={} "
                       "IsAddressInCodeBuffer={}",
                       GuestRip, HostCode, TFSet,
                       HostCode != 0 ? static_cast<Context::ContextImpl*>(Thread->CTX)->IsAddressInCodeBuffer(Thread, HostCode) : false);
+  }
+  if (HostCode == 0 || HostCode == reinterpret_cast<uintptr_t>(Record)) {
+    Frame->State.rip = GuestRip;
+    return Frame->Pointers.DispatcherLoopTop;
   }
   return HostCode;
 }
@@ -831,13 +817,27 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   ThreadState->LookupCache->Shared = CurrentCodeBuffer->LookupCache.get();
 }
 
+static inline void EnsureJITWritable() {
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+  pthread_jit_write_protect_np(0);
+#elif defined(__APPLE__)
+  typedef void (*jit_protect_fn_t)(int);
+  static auto fn_protect = reinterpret_cast<jit_protect_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+  if (fn_protect != nullptr) {
+    fn_protect(0);
+  }
+#endif
+}
+
 void Arm64JITCore::EmitDetectionString() {
+  EnsureJITWritable();
   const char JITString[] = "FEXJIT::Arm64JITCore::";
   EmitString(JITString);
   Align();
 }
 
 void Arm64JITCore::ClearCache() {
+  EnsureJITWritable();
   // NOTE: Holding on to the reference here is required to ensure validity of the WriteLock mutex
   auto PrevCodeBuffer = CurrentCodeBuffer;
   auto lk = PrevCodeBuffer->LookupCache->AcquireWriteLock();
@@ -856,6 +856,7 @@ void Arm64JITCore::ClearCache() {
   PrevCodeBuffer->LookupCache->ClearCache(lk);
 
   auto CodeBuffer = GetEmptyCodeBuffer();
+  EnsureJITWritable();
   SetBuffer(CodeBuffer->Ptr, CodeBuffer->AllocatedSize);
   EmitDetectionString();
 
@@ -1230,7 +1231,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     const uint32_t Word0c = *reinterpret_cast<const uint32_t*>(Traced.ThunkAddress + 0x0c);
     const uint64_t HostCodeField = *reinterpret_cast<const uint64_t*>(Traced.ThunkAddress + 0x10);
     const uint32_t CallerWord = *reinterpret_cast<const uint32_t*>(Traced.CallerAddress);
-    LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: post-compile thunk ThunkAddress={:#x} "
+    LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: post-compile thunk ThunkAddress={:#x} "
                       "CallerAddress={:#x} CallerWord={:#x} word00={:#x} word04={:#x} word08={:#x} "
                       "word0c={:#x} HostCodeField={:#x}",
                       Traced.ThunkAddress, Traced.CallerAddress, CallerWord, Word00, Word04, Word08, Word0c,
@@ -1317,6 +1318,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     // stay held that far past the metadata clear, and why the mutex must be acquired before the
     // pause is opened rather than after.
     bool HeldReuseSafepoint = false;
+    bool ReusedBuffer = false;
 
     // Query size of generated code
     const auto TempSize = GetCursorOffset();
@@ -1326,7 +1328,9 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                    "doesn't match up!\n");
       if (auto Prev = CheckCodeBufferUpdate()) {
-        Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+        if (!ThreadState->CallRetStackFromHeap && ThreadState->CallRetStackBase) {
+          Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, ThreadState->CallRetStackAllocSize);
+        }
         auto lk = ThreadState->LookupCache->AcquireWriteLock();
         ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
       }
@@ -1395,6 +1399,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         auto& InvalidationMutex = CTX->GetCodeInvalidationMutex();
         InvalidationMutex.unlock_shared();
         InvalidationMutex.lock();
+        ReusedBuffer = true;
         if (CTX->BeginBufferInvalidationSafepoint) {
           CTX->BeginBufferInvalidationSafepoint(ThreadState);
           HeldReuseSafepoint = true;
@@ -1437,7 +1442,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       // ever used for symbol/debug bookkeeping, never branched to, so it stays a write address.
       auto* const WriteSideValue = EntryPoint.second;
       EntryPoint.second = reinterpret_cast<uint8_t*>(FEXCore::Allocator::GetExecutableAddress(EntryPoint.second));
-      // Diagnostic-only, gated to the same GuestRIP as ExitFunctionLink's BACHATA_BLOODBORNE_
+      // Diagnostic-only, gated to the same GuestRIP as ExitFunctionLink's KYTY_BLOODBORNE_
       // THUNK_TRACE (this function's `Entry` is that same GuestRIP for the block being compiled
       // right now). GetExecutableAddress (Allocator.cpp) returns its input unchanged whenever the
       // write-side address isn't inside any region this thread's JIT allocator has actually
@@ -1447,7 +1452,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       // this fires unchanged for Bloodborne's traced GuestRIP, this is the same bug through a
       // different trigger than the one already fixed there.
       if (Entry == 0x7002047b00ULL && EntryPoint.second == WriteSideValue) {
-        LogMan::Msg::EFmt("BACHATA_BLOODBORNE_THUNK_TRACE: CompileCode GuestRIP={:#x} WriteSideValue={:#x} "
+        LogMan::Msg::EFmt("KYTY_BLOODBORNE_THUNK_TRACE: CompileCode GuestRIP={:#x} WriteSideValue={:#x} "
                           "GetExecutableAddress returned it UNCHANGED (untranslated -- likely bug)",
                           Entry, reinterpret_cast<uintptr_t>(WriteSideValue));
       }
@@ -1471,6 +1476,8 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     // shared reference it held on entry to this reuse-in-place branch.
     if (HeldReuseSafepoint) {
       CTX->EndBufferInvalidationSafepoint(ThreadState);
+    }
+    if (ReusedBuffer) {
       auto& InvalidationMutex = CTX->GetCodeInvalidationMutex();
       InvalidationMutex.unlock();
       InvalidationMutex.lock_shared();

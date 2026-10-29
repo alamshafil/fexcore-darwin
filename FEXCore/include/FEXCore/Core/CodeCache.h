@@ -232,7 +232,7 @@ class AbstractCodeCache {
   fextl::vector<std::span<std::byte>> MappedCodeBuffers;
 
 public:
-  virtual ~AbstractCodeCache() = default;
+  virtual ~AbstractCodeCache();
 
   /**
    * Computes a unique identifier for the referenced binary file to be used for

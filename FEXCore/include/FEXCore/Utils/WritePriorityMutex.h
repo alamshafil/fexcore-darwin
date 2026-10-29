@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #if defined(__APPLE__)
-#include <os/os_sync_wait_on_address.h>
+#include <shared_mutex>
 #elif !defined(_WIN32)
 #include <linux/futex.h> /* Definition of FUTEX_* constants */
 #include <sys/syscall.h> /* Definition of SYS_* constants */
@@ -22,6 +22,56 @@
 #include <FEXCore/Utils/SpinWaitLock.h>
 
 namespace FEXCore::Utils::WritePriorityMutex {
+
+#if defined(__APPLE__)
+// On Apple platforms (iOS/macOS), custom user-space futex state machines are susceptible to
+// writer-starvation / reader-deadlock under concurrent multi-threaded JIT compilation because
+// os_sync_wait_on_address lacks bitset-selective wakeups. std::shared_mutex uses native OS
+// primitives (os_unfair_lock / pthread_rwlock) which correctly prioritize and balance readers
+// and writers without deadlocking.
+class Mutex final {
+public:
+  Mutex() = default;
+
+  // Move-only type
+  Mutex(const Mutex&) = delete;
+  Mutex& operator=(const Mutex&) = delete;
+  Mutex(Mutex&& rhs) = delete;
+  Mutex& operator=(Mutex&&) = delete;
+
+  void lock() {
+    m_mutex.lock();
+  }
+
+  void unlock() {
+    m_mutex.unlock();
+  }
+
+  void lock_shared() {
+    m_mutex.lock_shared();
+  }
+
+  void unlock_shared() {
+    m_mutex.unlock_shared();
+  }
+
+  bool try_lock() {
+    return m_mutex.try_lock();
+  }
+
+  bool try_lock_shared() {
+    return m_mutex.try_lock_shared();
+  }
+
+  void StealAndDropActiveLocks() {
+    this->~Mutex();
+    new (this) Mutex();
+  }
+
+private:
+  std::shared_mutex m_mutex;
+};
+#else
 
 // A custom mutex that prioritizes exclusive locks.
 // In highly contested scenarios, this can help minimize overall contention time.
@@ -229,6 +279,8 @@ public:
     // - We ignore any reader-waiters here as they must wait their turn for writers that are waiting.
     if ((Desired & WRITE_WAITER_COUNT_MASK) && (Desired & READ_OWNER_COUNT_MASK) == 0) {
       FutexWakeWriter();
+    } else if ((Desired & READ_WAITER_BIT) && (Desired & WRITE_WAITER_COUNT_MASK) == 0 && (Desired & READ_OWNER_COUNT_MASK) == 0) {
+      FutexWakeReaders();
     }
   }
 
@@ -282,15 +334,22 @@ private:
   // wakeups by design (see the "Can get some spurious wake-ups" comment in lock_shared()) --
   // just occasionally less efficient than Linux's selective wake.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
-    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    os_sync_wait_on_address_with_timeout(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                         OS_CLOCK_MACH_ABSOLUTE_TIME, 5'000'000ull);
   }
 
   void FutexWaitForReadAvailable(uint32_t Expected) {
-    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    os_sync_wait_on_address_with_timeout(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                         OS_CLOCK_MACH_ABSOLUTE_TIME, 5'000'000ull);
   }
 
   void FutexWakeWriter() {
-    os_sync_wake_by_address_any(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    // On Darwin, os_sync_wait_on_address has no bitset filter to distinguish writers from
+    // readers. Using os_sync_wake_by_address_any can wake an arbitrary waiting reader instead
+    // of the waiting writer. The woken reader sees WRITE_WAITER_COUNT != 0 and immediately
+    // sleeps again, while the actual writer is never woken, permanently deadlocking all threads.
+    // Waking all ensures the waiting writer is always woken up.
+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
   }
 
   void FutexWakeReaders() {
@@ -434,4 +493,5 @@ private:
   //  Bits[15:0]: Read-owner count.
   uint32_t Futex {};
 };
+#endif
 } // namespace FEXCore::Utils::WritePriorityMutex

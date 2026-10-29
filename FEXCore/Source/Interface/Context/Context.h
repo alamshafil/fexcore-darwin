@@ -229,7 +229,7 @@ public:
   // failing on a session's 3rd+ fresh-allocation request) clears the calling thread's own L1/L2
   // lookup caches and the shared L3 cache/block-links, but has no visibility into any *other*
   // guest thread's independent L1/L2 cache -- those are owned per-thread by application-level
-  // code above this file (AetherPS4::Fex::GuestEngine, which tracks every live
+  // code above this file (Loader::Fex::FexGuestEngine, which tracks every live
   // InternalThreadState), not by anything FEXCore's own core keeps a list of. A stale L1/L2 hit
   // on another thread bypasses CodeInvalidationMutex and CompileBlock entirely (fast-path
   // lookups only ever consult L1/L2, per this file's "backends only check L1 and L2, not L3"
@@ -293,7 +293,7 @@ public:
   // stays frozen holding the shared reference for as long as the pause lasts. If the pausing
   // thread then tries to acquire the mutex exclusively *after* pausing everyone, it can deadlock
   // against exactly the thread it just froze mid-hold: confirmed on-device as a
-  // "BACHATA_BUFFER_REUSE: begin" with no matching completion ever following it, the session
+  // "KYTY_BUFFER_REUSE: begin" with no matching completion ever following it, the session
   // stuck indefinitely with zero further progress despite the safepoint's own accounting showing
   // every other thread successfully paused. Acquiring the mutex first avoids this by construction
   // -- a successful exclusive acquire already proves (via ordinary mutex semantics) that no thread

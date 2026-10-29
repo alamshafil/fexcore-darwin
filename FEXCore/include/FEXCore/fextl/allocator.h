@@ -3,6 +3,8 @@
 #include <FEXCore/Utils/AllocatorHooks.h>
 
 #include <memory>
+#include <new>
+#include <cstdlib>
 
 namespace fextl {
 /**
@@ -19,11 +21,22 @@ public:
   FEXAlloc(const FEXAlloc<U>&) noexcept {}
 
   inline value_type* allocate(std::size_t n) {
-    return reinterpret_cast<value_type*>(::FEXCore::Allocator::aligned_alloc(alignof(value_type), n * sizeof(value_type)));
+    if (n == 0) return nullptr;
+    auto ptr = reinterpret_cast<value_type*>(::FEXCore::Allocator::aligned_alloc(alignof(value_type), n * sizeof(value_type)));
+    if (!ptr) {
+#if __cpp_exceptions
+      throw std::bad_alloc();
+#else
+      std::abort();
+#endif
+    }
+    return ptr;
   }
 
   inline void deallocate(value_type* p, size_t) noexcept {
-    ::FEXCore::Allocator::aligned_free(p);
+    if (p) {
+      ::FEXCore::Allocator::aligned_free(p);
+    }
   }
 
   inline bool operator==(const FEXAlloc&) const {

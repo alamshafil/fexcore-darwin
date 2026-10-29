@@ -348,9 +348,9 @@ void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
 #if defined(FEX_APPLE_DUAL_MAPPED_JIT)
 // iOS JIT allocation: no MAP_JIT-equivalent is available to a sideloaded/free-provisioned
 // app, so executable memory instead comes from an externally-attached StikDebug session
-// servicing the same BRK #0xf00d protocol as src/core/ios/ios_jit_allocator.cpp in the
-// embedding app (Bachata-S4). Duplicated here rather than shared, since FEXCore-Darwin builds
-// as its own standalone static library with no dependency on Bachata-S4's own Core::
+// servicing the same BRK #0xf00d protocol as src/loader/fex/iosJitAllocator.cpp in the
+// embedding app (Kyty). Duplicated here rather than shared, since FEXCore-Darwin builds
+// as its own standalone static library with no dependency on Kyty's own
 // namespace.
 //
 // Ground truth, confirmed on-device the hard way (read from StikDebug's own source,
@@ -403,11 +403,28 @@ const BreakpointJITSymbols& GetBreakpointJITSymbols() noexcept {
     BreakpointJITSymbols s;
     void* handle =
       dlopen("@executable_path/Frameworks/BreakpointJIT.framework/BreakpointJIT", RTLD_NOW | RTLD_LOCAL);
-    if (handle == nullptr) {
-      return s;
+    if (handle != nullptr) {
+      s.get_jit_mapping = reinterpret_cast<BreakGetJITMappingFn>(dlsym(handle, "BreakGetJITMapping"));
+      s.jit_detach = reinterpret_cast<BreakJITDetachFn>(dlsym(handle, "BreakJITDetach"));
     }
-    s.get_jit_mapping = reinterpret_cast<BreakGetJITMappingFn>(dlsym(handle, "BreakGetJITMapping"));
-    s.jit_detach = reinterpret_cast<BreakJITDetachFn>(dlsym(handle, "BreakJITDetach"));
+    if (s.get_jit_mapping == nullptr) {
+      s.get_jit_mapping = reinterpret_cast<BreakGetJITMappingFn>(dlsym(RTLD_DEFAULT, "BreakGetJITMapping"));
+      s.jit_detach = reinterpret_cast<BreakJITDetachFn>(dlsym(RTLD_DEFAULT, "BreakJITDetach"));
+    }
+    if (s.get_jit_mapping == nullptr) {
+      s.get_jit_mapping = [](void* Addr, size_t Len) -> void* {
+        if (Addr != nullptr) return nullptr;
+        void* RX = ::mmap(nullptr, Len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (RX == MAP_FAILED) {
+          RX = ::mmap(nullptr, Len, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+        }
+        if (RX == MAP_FAILED) {
+          RX = ::mmap(nullptr, Len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        }
+        return RX == MAP_FAILED ? nullptr : RX;
+      };
+      s.jit_detach = []() {};
+    }
     return s;
   }();
   return symbols;
@@ -478,61 +495,27 @@ void* GetWritableAddress(void* ExecAddr) {
 // short of StikDebug's own logs.
 std::atomic<uint64_t> AllocationCounter{0};
 
+extern "C" bool KytyDualMappedAlloc(size_t size, void** out_rw, void** out_rx);
+extern "C" void KytyDualMappedFree(void* rw, void* rx, size_t size);
+
 void* iOSJITAlloc(size_t Size) {
   const uint64_t RequestNumber = AllocationCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-  const auto& Symbols = GetBreakpointJITSymbols();
-  if (Symbols.get_jit_mapping == nullptr) {
-    LogMan::Msg::EFmt("iOSJITAlloc #{}: BreakpointJIT symbols unavailable", RequestNumber);
-    return nullptr;
-  }
+  void* WriteAddr = nullptr;
+  void* ExecAddr = nullptr;
 
-  LogMan::Msg::IFmt("iOSJITAlloc #{}: requesting fresh execute-capable region (size={})",
-                    RequestNumber, Size);
-  void* ExecAddr = Symbols.get_jit_mapping(nullptr, Size);
-  if (ExecAddr == nullptr) {
-    LogMan::Msg::EFmt("iOSJITAlloc #{}: BreakGetJITMapping(nullptr, {}) returned nullptr -- StikDebug "
-                      "with the Universal JIT Script must be attached before this point, or its "
-                      "session has stopped responding.",
-                      RequestNumber, Size);
+  if (KytyDualMappedAlloc(Size, &WriteAddr, &ExecAddr) && WriteAddr != nullptr && ExecAddr != nullptr) {
+    LogMan::Msg::IFmt("iOSJITAlloc #{}: KytyDualMappedAlloc granted RW={} RX={} (size={})",
+                      RequestNumber, WriteAddr, ExecAddr, Size);
+  } else {
+    LogMan::Msg::EFmt("iOSJITAlloc #{}: KytyDualMappedAlloc failed for size={}", RequestNumber, Size);
     return nullptr;
   }
-  LogMan::Msg::IFmt("iOSJITAlloc #{}: BreakGetJITMapping returned {} (execute-side)", RequestNumber,
-                    ExecAddr);
-
-  // Remap a second, writable virtual alias of the SAME physical pages, purely locally -- see
-  // this file's top comment for why this half doesn't need the debugger at all. mach_vm.h's
-  // 64-bit-explicit API (mach_vm_remap et al.) isn't available on iOS ("mach_vm.h unsupported"
-  // from the SDK itself) -- vm_map.h's classic API works the same way here since vm_address_t
-  // is pointer-width on 64-bit Darwin.
-  vm_address_t WriteAddr = 0;
-  vm_prot_t CurProt = VM_PROT_NONE, MaxProt = VM_PROT_NONE;
-  kern_return_t Kr = vm_remap(mach_task_self(), &WriteAddr, static_cast<vm_size_t>(Size), /*mask=*/0,
-                               VM_FLAGS_ANYWHERE, mach_task_self(), reinterpret_cast<vm_address_t>(ExecAddr),
-                               /*copy=*/FALSE, &CurProt, &MaxProt, VM_INHERIT_NONE);
-  if (Kr != KERN_SUCCESS) {
-    LogMan::Msg::EFmt("iOSJITAlloc #{}: vm_remap failed for execute-side {} (size={}): "
-                      "kern_return_t {} ({})",
-                      RequestNumber, ExecAddr, Size, static_cast<int>(Kr), mach_error_string(Kr));
-    return nullptr;
-  }
-  Kr = vm_protect(mach_task_self(), WriteAddr, static_cast<vm_size_t>(Size), /*set_maximum=*/FALSE,
-                   VM_PROT_READ | VM_PROT_WRITE);
-  if (Kr != KERN_SUCCESS) {
-    LogMan::Msg::EFmt("iOSJITAlloc #{}: vm_protect(RW) failed for remapped {} (size={}): "
-                      "kern_return_t {} ({})",
-                      RequestNumber, reinterpret_cast<void*>(WriteAddr), Size, static_cast<int>(Kr),
-                      mach_error_string(Kr));
-    vm_deallocate(mach_task_self(), WriteAddr, static_cast<vm_size_t>(Size));
-    return nullptr;
-  }
-  LogMan::Msg::IFmt("iOSJITAlloc #{}: remapped writable alias {} (execute-side {})", RequestNumber,
-                    reinterpret_cast<void*>(WriteAddr), ExecAddr);
 
   auto& Table = GetJITMappingTable();
   std::lock_guard<std::mutex> Lock(Table.Mutex);
-  Table.WriteToExec[static_cast<uintptr_t>(WriteAddr)] = MappedRegion{reinterpret_cast<uintptr_t>(ExecAddr), Size};
-  Table.ExecToWrite[reinterpret_cast<uintptr_t>(ExecAddr)] = MappedRegion{static_cast<uintptr_t>(WriteAddr), Size};
-  return reinterpret_cast<void*>(WriteAddr);
+  Table.WriteToExec[reinterpret_cast<uintptr_t>(WriteAddr)] = MappedRegion{reinterpret_cast<uintptr_t>(ExecAddr), Size};
+  Table.ExecToWrite[reinterpret_cast<uintptr_t>(ExecAddr)] = MappedRegion{reinterpret_cast<uintptr_t>(WriteAddr), Size};
+  return WriteAddr;
 }
 
 bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size) {
@@ -545,8 +528,7 @@ bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size) {
   const auto ExecBase = It->second.OtherBase;
   Table.WriteToExec.erase(It);
   Table.ExecToWrite.erase(ExecBase);
-  vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(WriteAddr), static_cast<vm_size_t>(Size));
-  vm_deallocate(mach_task_self(), static_cast<vm_address_t>(ExecBase), static_cast<vm_size_t>(Size));
+  KytyDualMappedFree(WriteAddr, reinterpret_cast<void*>(ExecBase), Size);
   return true;
 }
 

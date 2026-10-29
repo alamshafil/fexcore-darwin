@@ -324,6 +324,7 @@ DEF_OP(RDRAND) {
 }
 
 DEF_OP(Yield) {
+  dmb(ARMEmitter::BarrierScope::ISHLD);
   yield();
 }
 

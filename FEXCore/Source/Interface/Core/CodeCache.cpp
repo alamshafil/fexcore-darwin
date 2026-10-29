@@ -71,6 +71,9 @@ MappedCodeCacheFile::~MappedCodeCacheFile() {
 #endif
 }
 
+AbstractCodeCache::~AbstractCodeCache() {
+}
+
 void AbstractCodeCache::RegisterMappedCodeBuffer(MappedCodeCacheFile& Code) {
   MappedCodeBuffers.push_back(Code.CodeBuffer);
   // Unregister on destruction of Code

@@ -220,28 +220,6 @@ void Dispatcher::EmitDispatcher() {
       // Shift the offset by the size of the block cache entry
       add(TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
 
-      // Snapshot the reuse-generation counter before reading the cached HostCode below, for the
-      // same reason and using the same mechanism as ExitFunctionLinker's own check (JITPointers::
-      // ReuseGenerationCounterAddress, see its comment, CoreState.h). This lookup is lock-free
-      // exactly like that one, but unlike it never calls into C++ at all -- there's no
-      // ExitFunctionLink-equivalent to piggyback a validated value on, so both the "before" and
-      // "after" reads have to happen entirely within this routine. TMP3 is unused elsewhere in
-      // this routine, so it's safe as a snapshot register across everything below.
-      //
-      // BlockLookupGenerationUnwired guards ONLY the dereference on the next line (can't safely
-      // dereference a null ReuseGenerationCounterAddress) -- it must never skip past the actual
-      // lookup logic below. An earlier version of this check used one label for both "unwired,
-      // skip the whole mechanism" and "skip just my own re-check at the end", which for the
-      // *unwired* case jumped straight past the entire original lookup (the ldp/sub/cbnz/cbz/L1
-      // update sequence below), leaving TMP4 completely uninitialized before the final `br` --
-      // confirmed on-device as a new, unrelated-looking crash (garbage register values, fault
-      // address 0x0) that had nothing to do with JIT reuse at all, introduced by this fix itself.
-      ARMEmitter::ForwardLabel BlockLookupGenerationUnwired;
-      ldr(TMP3, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
-      (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &BlockLookupGenerationUnwired);
-      ldr(TMP3, TMP3, 0);
-      (void)Bind(&BlockLookupGenerationUnwired);
-
       // The the full LookupCacheEntry with a single LDP.
       // Check the guest address first to ensure it maps to the address we are currently at.
       // This fixes aliasing problems
@@ -266,30 +244,6 @@ void Dispatcher::EmitDispatcher() {
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
 
-        // Re-check right before trusting TMP4: if the generation changed since the snapshot
-        // above, a reuse-in-place cycle completed while this thread was mid-lookup, and TMP4 may
-        // no longer point at valid code -- SafepointSignalHandler's own signal-based redirect for
-        // this exact range (fex_guest_engine.cpp) can miss this if this thread's own trip through
-        // the lookup finishes faster than signal delivery latency, same as ExitFunctionLinker's
-        // equivalent gap. Redirect to AbsoluteLoopTopAddress (this routine's own start) instead of
-        // trusting TMP4 -- safe unconditionally, since nothing above this point has any guest- or
-        // host-visible side effect (the L1 cache write just above is host-only bookkeeping,
-        // harmlessly stale/overwritten by whatever this retry finds).
-        //
-        // Re-loads and re-checks ReuseGenerationCounterAddress itself here rather than reusing
-        // TMP3's zero-ness, deliberately: TMP3 legitimately reads as 0 both when unwired (nothing
-        // to compare against) AND when wired but no reuse cycle has happened yet this session (a
-        // real, valid snapshot that just happens to be 0) -- conflating those would skip this
-        // whole check for that second, perfectly normal case.
-        ARMEmitter::ForwardLabel SkipBlockLookupRecheck;
-        ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.ReuseGenerationCounterAddress));
-        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipBlockLookupRecheck);
-        ldr(TMP1, TMP1, 0);
-        sub(TMP1, TMP1, TMP3);
-        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipBlockLookupRecheck);
-        ldr(TMP4, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
-
-        (void)Bind(&SkipBlockLookupRecheck);
         // Jump to the block
         br(TMP4);
       }
@@ -409,6 +363,10 @@ void Dispatcher::EmitDispatcher() {
     ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
 
     (void)Bind(&ProceedToExitFunctionLinkerBranch);
+    ARMEmitter::ForwardLabel ValidHostCode;
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &ValidHostCode);
+    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+    (void)Bind(&ValidHostCode);
     br(TMP1);
 
     // See JITPointers::DispatcherBlockLookupRangeEnd's own comment (CoreState.h) and
@@ -456,6 +414,10 @@ void Dispatcher::EmitDispatcher() {
     // finished writing (see the ExitFunctionLink path above's comment on why an explicit
     // ISB is cheap insurance here specifically, on iOS's dual-mapped JIT scheme).
     isb();
+    ARMEmitter::ForwardLabel ValidBlock;
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &ValidBlock);
+    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+    (void)Bind(&ValidBlock);
     br(TMP1);
   }
 

@@ -32,6 +32,9 @@ template<class T, class... Args>
 requires (!std::is_array_v<T>)
 fextl::unique_ptr<T> make_unique(Args&&... args) {
   auto ptr = FEXCore::Allocator::aligned_alloc(alignof(T), sizeof(T));
+  if (ptr == nullptr) {
+    std::abort();
+  }
   auto Result = ::new (ptr) T(std::forward<Args>(args)...);
   return fextl::unique_ptr<T>(Result);
 }

@@ -1640,6 +1640,10 @@ DEF_OP(StoreMem) {
   const auto Op = IROp->C<IR::IROp_StoreMem>();
   const auto OpSize = IROp->Size;
 
+  // Enforce store-store ordering (ARM64 DMB ISHST) without trapping on unaligned memory:
+  // Guarantees constructor writes and payload buffers are globally committed before pointers/indices are stored.
+  dmb(ARMEmitter::BarrierScope::ISHST);
+
   const auto MemReg = GetReg(Op->Addr);
   const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
@@ -1753,6 +1757,9 @@ DEF_OP(StoreMemPair) {
   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
   const auto OpSize = IROp->Size;
   const auto Addr = GetReg(Op->Addr);
+
+  // Enforce store-store ordering before pair stores
+  dmb(ARMEmitter::BarrierScope::ISHST);
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Src1 = GetZeroableReg(Op->Value1);

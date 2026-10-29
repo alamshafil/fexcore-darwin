@@ -66,8 +66,8 @@ public:
 
   // Crash-diagnostic only: the dispatcher's own known-good, already-RX-translated entry
   // addresses, for direct comparison against whatever is actually stored in a live thread's
-  // CpuStateFrame::Pointers at the moment of a crash (see BachataDumpDispatcherState in
-  // fex_guest_engine.cpp). DispatchPtr is the dispatcher's function entry point (its very
+  // CpuStateFrame::Pointers at the moment of a crash (see KytyDumpDispatcherState in
+  // fexGuestEngine.cpp). DispatchPtr is the dispatcher's function entry point (its very
   // first emitted byte); DispatcherLoopTopAddress is a separate label further into the same
   // generated code, past the prologue -- these are two genuinely different addresses by
   // construction (confirmed: ~0xa0 bytes apart in EmitDispatcher, matching AbsoluteLoopTop's

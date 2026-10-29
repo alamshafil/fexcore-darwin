@@ -264,6 +264,21 @@ DEF_OP(ExitFunction) {
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
     (void)Bind(&SkipComputedBranchRecheck);
+
+    // Guard against NULL branch target (e.g. unlinked/empty call-ret or L1 cache entry)
+    ARMEmitter::ForwardLabel ValidBranchTarget;
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &ValidBranchTarget);
+    ARMEmitter::ForwardLabel NullGuestTarget;
+    (void)cbz(ARMEmitter::Size::i64Bit, RipReg.X(), &NullGuestTarget);
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+    str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    (void)b(&ValidBranchTarget);
+
+    (void)Bind(&NullGuestTarget);
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.GuestSignal_SIGSEGV));
+    str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    (void)Bind(&ValidBranchTarget);
+
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
       if (!Op->CallReturnBlock.IsInvalid()) {

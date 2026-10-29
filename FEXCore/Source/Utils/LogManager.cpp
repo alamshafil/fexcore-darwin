@@ -22,7 +22,7 @@ namespace Throw {
 
   void MFmt(const char* fmt, const fmt::format_args& args) {
     if (Handler) {
-      auto msg = fextl::fmt::vformat(fmt, args);
+      auto msg = ::fmt::vformat(fmt, args);
       Handler(msg.c_str());
     }
 
@@ -41,7 +41,7 @@ namespace Msg {
 
   void MFmtImpl(DebugLevels level, const char* fmt, const fmt::format_args& args) {
     if (Handler) {
-      const auto msg = fextl::fmt::vformat(fmt, args);
+      const auto msg = ::fmt::vformat(fmt, args);
       Handler(level, msg.c_str());
     }
   }

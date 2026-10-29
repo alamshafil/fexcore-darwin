@@ -1376,6 +1376,9 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();
+  if (PC < 0x10000 || _InstStream == nullptr) {
+    return;
+  }
   // Reset internal state management
   DecodedSize = 0;
   MaxCondBranchForward = 0;
@@ -1384,7 +1387,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
 
   // Decode operating mode from thread's CS segment.
   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
-  BlockInfo.Is64BitMode = CSSegment->L == 1;
+  BlockInfo.Is64BitMode = CSSegment ? (CSSegment->L == 1) : (CTX->Config.Is64BitMode != 0);
   LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
 
   EntryPoint = PC;
@@ -1521,13 +1524,14 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           InstStream -= PCOffset;
           EraseBlock = true;
         } else {
-          LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
+          const auto* p = reinterpret_cast<const uint8_t*>(OpAddress);
+          LogMan::Msg::EFmt("{} instruction in entry block: {:X} [bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                             BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
                             BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
                             BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
                                                                                              "PartialDecode",
-                            OpAddress);
+                            OpAddress, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
         }
         break;
       }

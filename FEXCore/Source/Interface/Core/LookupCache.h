@@ -214,7 +214,7 @@ public:
       auto lk = Shared->AcquireReadLock();
       LockTime.reset();
 
-      if (!DisableL2Cache()) {
+      if (!DisableL2Cache() && PageMemory != 0) {
         // Try L2
         const auto PageIndex = (Address & (VirtualMemSize - 1)) >> 12;
         const auto PageOffset = Address & (0x0FFF);
@@ -345,7 +345,7 @@ public:
       // and it hasn't been thoroughly tested
     }
 
-    if (!DisableL2Cache()) {
+    if (!DisableL2Cache() && PageMemory != 0) {
       // Do full map
       Address = Address & (VirtualMemSize - 1);
       uint64_t PageOffset = Address & (0x0FFF);
@@ -435,7 +435,7 @@ private:
     std::atomic_signal_fence(std::memory_order_seq_cst);
     L1Entry.GuestCode = Address;
 
-    if (!DisableL2Cache() && !L1Only) {
+    if (!DisableL2Cache() && !L1Only && PageMemory != 0) {
       // Do ful map
       auto FullAddress = Address;
       Address = Address & (VirtualMemSize - 1);
@@ -469,6 +469,9 @@ private:
   }
 
   uintptr_t AllocateBackingForPage() {
+    if (PageMemory == 0) {
+      return 0;
+    }
     uintptr_t NewBase = AllocateOffset;
     uintptr_t NewEnd = AllocateOffset + SIZE_PER_PAGE;
 
@@ -495,7 +498,11 @@ private:
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
+#if defined(__APPLE__)
+  constexpr static size_t MAX_L1_ENTRIES = 64 * 1024;       // 1 MB per thread on Apple/iOS (prevents address space exhaustion)
+#else
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
+#endif
 
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
   constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);

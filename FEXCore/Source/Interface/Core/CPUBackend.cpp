@@ -20,22 +20,16 @@
 namespace FEXCore {
 namespace CPU {
 
-  static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 #if defined(FEX_APPLE_DUAL_MAPPED_JIT)
-  // Every JIT allocation on iOS has to be individually granted execute permission by
-  // StikDebug's external BreakpointJIT mechanism (a slow, page-by-page GDB-remote-mediated
-  // protocol -- see AllocatorHooks.h's iOS section). Confirmed on-device: the initial 16MB
-  // buffer (INITIAL_CODE_SIZE above) allocates fine, but the first *growth* step -- doubling
-  // to 32MB once that fills up, which only a heavier title's larger codebase (Minecraft; a
-  // lighter title never filled the first 16MB buffer at all) ever actually exercised for the
-  // first time this whole port -- crashed inside that external call before it could even
-  // return, never reaching this file's own success/failure logging. Capping growth at the
-  // already-proven-working 16MB (StartLargerCodeBuffer's std::min(latest*2, MAX_CODE_SIZE)
-  // then always returns the same 16MB every time, i.e. growth is disabled rather than
-  // guessing at some other untested larger size) trades more frequent ClearCodeCache
-  // evictions (some re-JIT overhead) for allocations that actually succeed.
+  // Preallocated 64MB JIT pool fits 60MB code buffer in a single allocation
+  static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 60;
   static constexpr size_t MAX_CODE_SIZE = INITIAL_CODE_SIZE;
+#elif defined(__APPLE__)
+  // On macOS Apple Silicon, allocate full 128MB upfront
+  static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 128;
+  static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 #else
+  static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
   // We don't want to move above 128MB atm because that means we will have to encode longer jumps
   static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 #endif
@@ -413,6 +407,12 @@ namespace CPU {
       // is unconditional, and a failure here is never recoverable anyway.
       ERROR_AND_DIE_FMT("Couldn't allocate code buffer: {}", errno);
     }
+    // Apple Silicon APRR requires write permissions to be explicitly enabled on the calling
+    // thread after a new MAP_JIT region is mapped, otherwise immediate writes
+    // trigger KERN_PROTECTION_FAILURE.
+#if !TARGET_OS_IPHONE
+    pthread_jit_write_protect_np(0);
+#endif
 #else
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
     // LOGMAN_THROW_A_FMT compiles to a complete no-op ((void)(pred);) unless

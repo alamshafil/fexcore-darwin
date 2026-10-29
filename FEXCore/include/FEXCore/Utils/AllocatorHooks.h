@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #ifdef __APPLE__
 #include <pthread.h>
+#include <dlfcn.h>
 #include <TargetConditionals.h>
 // FEX_APPLE_DUAL_MAPPED_JIT: executable memory is a dual-mapped RW/RX pair (see the iOS section
 // below). True on iOS, and on macOS when FEXCore is built for the Mac harness of the phone
@@ -131,7 +132,7 @@ FEX_DEFAULT_VISIBILITY extern void VirtualName(const char* Name, void* Ptr, size
 
 #if defined(FEX_APPLE_DUAL_MAPPED_JIT)
 // iOS has no MAP_JIT-equivalent available to a sideloaded/free-provisioned app (no
-// dynamic-codesigning entitlement). Executable allocations here instead go through Bachata's
+// dynamic-codesigning entitlement). Executable allocations here instead go through Kyty's
 // StikDebug BreakpointJIT protocol (see iOSJITAlloc/iOSJITFreeIfOwned below, implemented in
 // Allocator.cpp).
 //
@@ -176,15 +177,30 @@ enum class iOSJITAddressKind {
 // Crash-diagnostic only -- see Allocator.cpp's definition for what each result means.
 iOSJITAddressKind iOSJITDescribeAddress(void* Addr, uintptr_t* OutRegionBase, size_t* OutOffset, size_t* OutSize);
 
-// On iOS the RW half of a dual-mapped allocation is ordinary (remapped) memory -- always
-// writable, no per-thread W^X state to toggle (that's a MAP_JIT-specific concept; see the
-// macOS branch below). Writes go straight through the RW address at all times, so this guard
-// is a no-op here.
+// On Apple platforms (iOS/macOS), ensure per-thread JIT write protection is toggled
+// properly around code generation regardless of single or dual mapping.
 class ScopedJITWriteProtect final {
 public:
-  ScopedJITWriteProtect() = default;
+  ScopedJITWriteProtect() {
+#if defined(__APPLE__)
+    typedef void (*jit_protect_fn_t)(int);
+    static auto fn = reinterpret_cast<jit_protect_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+    if (fn != nullptr) {
+      fn(0);
+    }
+#endif
+  }
   ScopedJITWriteProtect(const ScopedJITWriteProtect&) = delete;
   ScopedJITWriteProtect& operator=(const ScopedJITWriteProtect&) = delete;
+  ~ScopedJITWriteProtect() {
+#if defined(__APPLE__)
+    typedef void (*jit_protect_fn_t)(int);
+    static auto fn = reinterpret_cast<jit_protect_fn_t>(dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+    if (fn != nullptr) {
+      fn(1);
+    }
+#endif
+  }
 };
 #elif defined(__APPLE__)
 // Apple Silicon rejects PROT_EXEC on a plain mmap outright (EACCES) -- confirmed empirically.

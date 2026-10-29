@@ -72,7 +72,7 @@ DEF_OP(EntrypointOffset) {
   // it after the fact from a "write to 0x0" crash dump, which doesn't say which of the many
   // memory operands in a block was the wrong one.
   if ((Constant & Mask) == 0) {
-    LogMan::Msg::EFmt("BACHATA_ENTRYPOINT_OFFSET_ZERO: Entry={:#x} Offset={:#x} OpSize={} -> "
+    LogMan::Msg::EFmt("KYTY_ENTRYPOINT_OFFSET_ZERO: Entry={:#x} Offset={:#x} OpSize={} -> "
                       "Constant=0 (suspicious -- no real guest address should ever resolve here)",
                       Entry, Op->Offset, static_cast<int>(OpSize));
   }
