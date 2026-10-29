@@ -22,6 +22,7 @@
 #include <FEXHeaderUtils/Filesystem.h>
 
 #include <algorithm>
+#include <fmt/ranges.h>
 #include <git_version.h>
 
 #include <span>
@@ -517,8 +518,10 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     if (GuestBlockAddr != GuestBlockAddrRef) {
       GuestBlockInfo += " (MISMATCH)";
     }
+    auto CachedSlice = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(CachedCode.data() + Idx), 4);
+    auto RefSlice = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(CodeBufferRangeRef.data() + Idx), 4);
     ERROR_AND_DIE_FMT("Cache validation failed at offset {:#x}: {:02x} <-> {:02x} (at {} <-> {}, guest block {})", Idx,
-                      fmt::join(CachedCode.subspan(Idx, 4), ""), fmt::join(CodeBufferRangeRef.subspan(Idx, 4), ""),
+                      fmt::join(CachedSlice, ""), fmt::join(RefSlice, ""),
                       fmt::ptr(CachedCode.data()), fmt::ptr(CodeBufferRangeRef.data()), GuestBlockInfo);
   }
 
