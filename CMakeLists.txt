@@ -437,7 +437,9 @@ if (FEX_BUILD_TESTS)
   include(Catch)
 else ()
   # Override any previously generated test list to avoid running stale test binaries
-  file(GENERATE OUTPUT CTestTestfile.cmake CONTENT "# No tests since BUILD_TESTING is disabled")
+  if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    file(GENERATE OUTPUT CTestTestfile.cmake CONTENT "# No tests since BUILD_TESTING is disabled")
+  endif()
 endif()
 
 if (NOT TARGET fmt::fmt)
