@@ -5,7 +5,7 @@ tags: backend|arm64
 $end_info$
 */
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <syscall.h>
 #endif
 
@@ -238,6 +238,17 @@ DEF_OP(ProcessorID) {
   else {
     // If on Windows and TPIDRRO isn't supported (like in wine), then this is a programming error.
     ERROR_AND_DIE_FMT("Unsupported");
+  }
+#elif defined(__APPLE__)
+  else {
+    // The Linux-only fallback below emits a raw `SVC #0` trap with a hard-coded Linux syscall
+    // number (SYS_getcpu) directly into the JIT'd code -- there's no safe Darwin equivalent
+    // (XNU's syscall numbers/ABI aren't a stable third-party-usable contract the way Linux's
+    // is, and Darwin's kernel doesn't populate TPIDRRO_EL0 with a CPU index either, so the fast
+    // path above never triggers here). This value only feeds CPUID emulation output, which
+    // doesn't need to be live-accurate (same reasoning as FHU::Syscalls::getcpu's Darwin
+    // implementation) -- materialize a constant 0 instead of emitting any syscall at all.
+    LoadConstant(ARMEmitter::Size::i64Bit, GetReg(Node), 0);
   }
 #else
   // We always need to spill x8 since we can't know if it is live at this SSA location

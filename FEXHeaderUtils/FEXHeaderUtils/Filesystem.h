@@ -10,8 +10,13 @@
 #include <memory_resource>
 #include <string_view>
 #ifndef _WIN32
-#include <linux/limits.h>
+// PATH_MAX is POSIX-standard and declared in <limits.h> on every platform this codebase
+// targets (Linux's <linux/limits.h> just happens to be where it's *also* defined there,
+// redundantly with the POSIX one).
+#include <limits.h>
+#ifndef __APPLE__
 #include <sys/sendfile.h>
+#endif
 #else
 #include <filesystem>
 #endif
@@ -216,7 +221,29 @@ inline bool CopyFile(const fextl::string& From, const fextl::string& To, CopyOpt
       close(SourceFD);
       return false;
     }
+#ifdef __APPLE__
+    // Darwin's sendfile() can only target a socket (`man sendfile`: "sends a regular file...
+    // out a stream socket"), not a second regular file -- unlike Linux's, which supports
+    // file-to-file. Fall back to a plain read/write copy loop, which is portable and behaves
+    // identically to the sendfile() path above for this whole-file, offset-0 copy.
+    off_t Remaining = buf.st_size;
+    bool Result = true;
+    char CopyBuffer[65536];
+    while (Remaining > 0) {
+      ssize_t ReadBytes = read(SourceFD, CopyBuffer, std::min<off_t>(Remaining, sizeof(CopyBuffer)));
+      if (ReadBytes <= 0) {
+        Result = false;
+        break;
+      }
+      if (write(DestinationFD, CopyBuffer, ReadBytes) != ReadBytes) {
+        Result = false;
+        break;
+      }
+      Remaining -= ReadBytes;
+    }
+#else
     bool Result = sendfile(DestinationFD, SourceFD, nullptr, buf.st_size) == buf.st_size;
+#endif
     close(DestinationFD);
     close(SourceFD);
     return Result;

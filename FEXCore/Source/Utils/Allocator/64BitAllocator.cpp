@@ -24,7 +24,11 @@
 #include <new>
 #include <sys/mman.h>
 #include <sys/utsname.h>
+// Unused (FEXCore::Utils::FEX_PAGE_SIZE is used throughout instead) -- present on macOS's SDK
+// but not iOS's, same as IntrusiveArenaAllocator.h's identical unused include.
+#ifndef __APPLE__
 #include <sys/user.h>
+#endif
 #include <type_traits>
 #include <utility>
 
@@ -505,8 +509,12 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
     // Allocate up to 64 MiB the first allocation for an intrusive allocator
     mprotect(it.Ptr, ObjectAllocSize, PROT_READ | PROT_WRITE);
 
-    // This enables the kernel to use transparent large pages in the allocator which can reduce memory pressure
+    // This enables the kernel to use transparent large pages in the allocator which can reduce memory pressure.
+    // No Darwin equivalent (its VM system manages superpages automatically, no per-mapping
+    // opt-in) -- purely a performance hint either way, safe to skip.
+#ifndef __APPLE__
     ::madvise(it.Ptr, ObjectAllocSize, MADV_HUGEPAGE);
+#endif
 
     FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(it.Ptr), ObjectAllocSize);
 

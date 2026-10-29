@@ -5,6 +5,7 @@
 #include <FEXCore/Utils/SpinWaitLock.h>
 
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Telemetry.h>
@@ -2046,9 +2047,25 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   }
 
   const auto Frame = Thread->CurrentFrame;
-  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
+  // InlineJITBlockHeader is a PC-relative (adr-computed) address written by the JIT's own
+  // generated entry-point code (Arm64JITCore::EmitEntryPoint: `adr TMP1, HeaderLabel`), so
+  // it always points at the EXECUTABLE-side alias of the code buffer -- the same alias
+  // this function's own `ProgramCounter` parameter must already be translated away from
+  // by the caller on iOS's dual-mapped JIT memory (see fex_guest_engine.cpp's
+  // HandleGuestSignal). The executable alias there is not guaranteed readable, and
+  // dereferencing it here -- while already inside a signal handler for an unrelated fault
+  // -- previously caused a second, undeliverable fault that silently killed the handling
+  // thread outright: no crash report, no further log output on any path past this point,
+  // yet the rest of the process kept running unaffected. That matched exactly what was
+  // observed on-device, and was confirmed by an atomic checkpoint counter (touches no I/O,
+  // can't itself hang or fault) showing execution reaching the call into this function and
+  // never advancing past it. Translate to the writable alias first; the header/tail layout
+  // and offsets are address-independent (same physical page), so this is a no-op on every
+  // platform except iOS, where GetWritableAddress does a real translation.
+  const uint64_t BlockBegin = reinterpret_cast<uint64_t>(FEXCore::Allocator::GetWritableAddress(
+      reinterpret_cast<void*>(Frame->State.InlineJITBlockHeader)));
   auto InlineHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
-  auto InlineTail = reinterpret_cast<CPU::CPUBackend::JITCodeTail*>(Frame->State.InlineJITBlockHeader + InlineHeader->OffsetToBlockTail);
+  auto InlineTail = reinterpret_cast<CPU::CPUBackend::JITCodeTail*>(BlockBegin + InlineHeader->OffsetToBlockTail);
 
   // Check some instructions first that don't do any backpatching.
   if ((Instr & ArchHelpers::Arm64::CASPAL_MASK) == ArchHelpers::Arm64::CASPAL_INST) { // CASPAL

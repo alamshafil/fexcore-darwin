@@ -4,7 +4,11 @@
 #include <FEXCore/fextl/fmt.h>
 
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <limits.h> // PATH_MAX -- POSIX-standard, not linux/limits.h here
+#else
 #include <linux/limits.h>
+#endif
 #include <unistd.h>
 
 namespace FEX {

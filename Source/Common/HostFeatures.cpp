@@ -14,6 +14,10 @@
 #include "Common/X86Features.h"
 #endif
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 namespace FEX {
 
 void FillMIDRInformationViaLinux(FEXCore::HostFeatures* Features) {
@@ -103,6 +107,105 @@ public:
 FEX::CPUFeatures GetCPUFeaturesFromIDRegisters() {
   return CPUFeaturesFromID {};
 }
+
+#ifdef __APPLE__
+// Darwin's XNU doesn't emulate EL0 reads of the ID_AA64*_EL1/MIDR_EL1 registers the way the
+// Linux kernel does (confirmed empirically: a standalone `mrs x0, id_aa64isar0_el1` and
+// `mrs x0, midr_el1` both raise SIGILL here) -- so CPUFeaturesFromID's raw-MRS approach can't
+// work on this platform at all. Apple instead exposes individual confirmed feature booleans
+// via sysctlbyname("hw.optional.arm.FEAT_*", ...), which is what's used below. Only features
+// with a real Apple-documented sysctl name are set; anything without a confirmed sysctl name
+// on this OS is deliberately left unset (false) rather than guessed, matching this file's own
+// "unset == unsupported" convention (e.g. the ISAR2 fields FEX never bothers reading either).
+//
+// (DCZID_EL0 is a genuine exception: unlike the ID_* registers, it's architecturally meant to
+// be EL0-readable and empirically does work here (`mrs x0, dczid_el0` succeeds), so it's still
+// read directly via the existing Get_DCZID_EL0() below.)
+static bool SysctlFeaturePresent(const char* Name) {
+  int32_t Value = 0;
+  size_t Size = sizeof(Value);
+  if (::sysctlbyname(Name, &Value, &Size, nullptr, 0) != 0) {
+    return false;
+  }
+  return Value != 0;
+}
+
+class CPUFeaturesFromDarwinSysctl final : public FEX::CPUFeatures {
+public:
+  CPUFeaturesFromDarwinSysctl() {
+    const auto SetIf = [this](const char* Name, Feature Feat) {
+      if (SysctlFeaturePresent(Name)) {
+        SetFeature(Feat);
+      }
+    };
+
+    // ISAR0
+    SetIf("hw.optional.arm.FEAT_AES", Feature::AES);
+    SetIf("hw.optional.arm.FEAT_PMULL", Feature::PMULL);
+    SetIf("hw.optional.arm.FEAT_SHA1", Feature::SHA1);
+    SetIf("hw.optional.arm.FEAT_SHA256", Feature::SHA2);
+    SetIf("hw.optional.arm.FEAT_SHA512", Feature::SHA512);
+    SetIf("hw.optional.arm.FEAT_CRC32", Feature::CRC32);
+    SetIf("hw.optional.arm.FEAT_LSE", Feature::LSE);
+    SetIf("hw.optional.arm.FEAT_RDM", Feature::RDM);
+    SetIf("hw.optional.arm.FEAT_SHA3", Feature::SHA3);
+    SetIf("hw.optional.arm.FEAT_DotProd", Feature::DotProd);
+    SetIf("hw.optional.arm.FEAT_FlagM", Feature::FlagM);
+    SetIf("hw.optional.arm.FEAT_FlagM2", Feature::FlagM2);
+
+    // PFR0
+    SetIf("hw.optional.floatingpoint", Feature::FP);
+    SetIf("hw.optional.arm.FEAT_FP16", Feature::FP16);
+    SetIf("hw.optional.neon", Feature::ASIMD);
+    SetIf("hw.optional.neon_hpfp", Feature::ASIMD16);
+    SetIf("hw.optional.arm.FEAT_DIT", Feature::DIT);
+    SetIf("hw.optional.arm.FEAT_CSV2", Feature::CSV2);
+    SetIf("hw.optional.arm.FEAT_CSV3", Feature::CSV3);
+    // No SVE on any Apple Silicon chip -- deliberately never set, which also correctly
+    // gates off every SVE2/ZFR0-derived feature below (all read through Supports(SVE)).
+
+    // PFR1
+    SetIf("hw.optional.arm.FEAT_BTI", Feature::BTI);
+    SetIf("hw.optional.arm.FEAT_SSBS", Feature::SSBS);
+    SetIf("hw.optional.arm.FEAT_MTE", Feature::MTE);
+    SetIf("hw.optional.arm.FEAT_MTE2", Feature::MTE2);
+    SetIf("hw.optional.arm.FEAT_MTE3", Feature::MTE3);
+    SetIf("hw.optional.arm.FEAT_SME", Feature::SME);
+    SetIf("hw.optional.arm.FEAT_SME2", Feature::SME2);
+
+    // ISAR1
+    SetIf("hw.optional.arm.FEAT_DPB", Feature::DPB);
+    SetIf("hw.optional.arm.FEAT_DPB2", Feature::DPB2);
+    SetIf("hw.optional.arm.FEAT_JSCVT", Feature::JSCVT);
+    SetIf("hw.optional.arm.FEAT_FCMA", Feature::FCMA);
+    SetIf("hw.optional.arm.FEAT_LRCPC", Feature::LRCPC);
+    SetIf("hw.optional.arm.FEAT_LRCPC2", Feature::LRCPC2);
+    SetIf("hw.optional.arm.FEAT_FRINTTS", Feature::FRINTTS);
+    SetIf("hw.optional.arm.FEAT_SB", Feature::SB);
+    SetIf("hw.optional.arm.FEAT_SPECRES", Feature::SPECRES);
+    SetIf("hw.optional.arm.FEAT_BF16", Feature::BF16);
+    SetIf("hw.optional.arm.FEAT_SME_F64F64", Feature::SME_F64F64);
+    SetIf("hw.optional.arm.FEAT_I8MM", Feature::I8MM);
+
+    // MMFR0 / MMFR1 / MMFR2
+    SetIf("hw.optional.arm.FEAT_ECV", Feature::ECV);
+    SetIf("hw.optional.arm.FEAT_AFP", Feature::AFP);
+    SetIf("hw.optional.arm.FEAT_LSE2", Feature::LSE2);
+
+    // ISAR2
+    SetIf("hw.optional.arm.FEAT_WFxT", Feature::WFxt);
+    SetIf("hw.optional.arm.FEAT_RPRES", Feature::RPRES);
+    SetIf("hw.optional.arm.FEAT_HBC", Feature::HBC);
+    SetIf("hw.optional.arm.FEAT_CSSC", Feature::CSSC);
+
+    DCZID.SetReg(Get_DCZID_EL0());
+  }
+};
+
+FEX::CPUFeatures GetCPUFeaturesFromDarwinSysctl() {
+  return CPUFeaturesFromDarwinSysctl {};
+}
+#endif
 #endif
 
 class CPUFeaturesFromConfig final : public FEX::CPUFeatures {
@@ -604,6 +707,8 @@ FEXCore::HostFeatures FetchHostFeatures() {
     Features.RemoveFeature(CPUFeatures::Feature::AFP);
     // Vixl simulator doesn't support RPRES.
     Features.RemoveFeature(CPUFeatures::Feature::RPRES);
+#elif defined(__APPLE__)
+    Features = GetCPUFeaturesFromDarwinSysctl();
 #else
     Features = GetCPUFeaturesFromIDRegisters();
 #endif
@@ -611,7 +716,27 @@ FEXCore::HostFeatures FetchHostFeatures() {
 
   uint64_t CTR = 0;
   uint64_t MIDR = 0;
-#if defined(ARCHITECTURE_arm64) && !defined(VIXL_SIMULATOR)
+#if defined(__APPLE__)
+  // Neither ctr_el0 nor midr_el1 are EL0-readable on Darwin (confirmed empirically: both
+  // raise SIGILL here, unlike Linux where the kernel emulates them). Cache line size is
+  // available directly via sysctl instead; MIDR is left 0, which HandleErrata() already
+  // treats as "unrecognized implementer" and safely no-ops on (matching its existing
+  // graceful handling of the CTR==0 case just below).
+  {
+    int64_t CacheLineSize = 0;
+    size_t Size = sizeof(CacheLineSize);
+    if (::sysctlbyname("hw.cachelinesize", &CacheLineSize, &Size, nullptr, 0) == 0 && CacheLineSize > 0) {
+      // Synthesize a CTR_EL0-shaped value so the shared DCacheLineSize/ICacheLineSize decode
+      // below (4 << field) stays the single source of truth instead of duplicating it here.
+      // Apple Silicon reports a single unified cache line size for both D$ and I$.
+      uint64_t Log2Words = 0;
+      while ((4ULL << Log2Words) < static_cast<uint64_t>(CacheLineSize)) {
+        ++Log2Words;
+      }
+      CTR = Log2Words | (Log2Words << 16);
+    }
+  }
+#elif defined(ARCHITECTURE_arm64) && !defined(VIXL_SIMULATOR)
   // We need to get the CPU's cache line size
   // We expect sane targets that have correct cacheline sizes across clusters
   __asm volatile("mrs %[ctr], ctr_el0" : [ctr] "=r"(CTR));

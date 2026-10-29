@@ -3,8 +3,20 @@
 
 #ifndef _WIN32
 #include <sys/mman.h>
+#ifdef __APPLE__
+// Darwin has no prctl() at all -- every use in this codebase is an optional/cosmetic Linux
+// hardening or debug-visibility feature (MDWE status query, naming anonymous mappings for
+// /proc/self/maps), never something correctness-critical. Stub it to look like "operation not
+// supported", the same as how prctl() itself reports an unrecognized option on Linux.
+#include <cerrno>
+inline int prctl(int, ...) {
+  errno = ENOSYS;
+  return -1;
+}
+#else
 #include <sys/user.h>
 #include <sys/prctl.h>
+#endif
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41

@@ -15,10 +15,16 @@
 
 #include <cstdlib>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <limits.h> // PATH_MAX, in <limits.h> here (not linux/limits.h) -- POSIX-standard
+#else
 #include <linux/limits.h>
+#endif
 #include <unistd.h>
 #include <poll.h>
+#if !defined(__APPLE__)
 #include <sys/prctl.h>
+#endif
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>

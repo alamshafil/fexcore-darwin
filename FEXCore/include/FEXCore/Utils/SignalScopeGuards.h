@@ -158,7 +158,31 @@ public:
   explicit ScopedSignalMasker(uint64_t Mask)
     : OriginalMask(0) {
     // Mask all signals, storing the original incoming mask
+#ifdef __APPLE__
+    // Not currently instantiated anywhere in this codebase (dead code as of this port), so this
+    // is unverified by any real caller -- flagging for real attention if that ever changes.
+    // Linux's raw rt_sigprocmask syscall works on a 64-bit mask (covering realtime signals
+    // 33-64); Darwin's sigset_t is only 32 bits (BSD signal range), so anything relying on the
+    // upper 32 bits here would silently lose those bits going through pthread_sigmask.
+    sigset_t NewSet;
+    sigemptyset(&NewSet);
+    for (int sig = 1; sig <= 32; ++sig) {
+      if (Mask & (1ULL << (sig - 1))) {
+        sigaddset(&NewSet, sig);
+      }
+    }
+    sigset_t OldSet;
+    pthread_sigmask(SIG_SETMASK, &NewSet, &OldSet);
+    uint64_t OldMaskValue = 0;
+    for (int sig = 1; sig <= 32; ++sig) {
+      if (sigismember(&OldSet, sig)) {
+        OldMaskValue |= (1ULL << (sig - 1));
+      }
+    }
+    OriginalMask = OldMaskValue;
+#else
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &*OriginalMask, sizeof(*OriginalMask));
+#endif
   }
 
   // Move-only type
@@ -171,7 +195,18 @@ public:
 
   ~ScopedSignalMasker() {
     if (OriginalMask) {
+#ifdef __APPLE__
+      sigset_t RestoreSet;
+      sigemptyset(&RestoreSet);
+      for (int sig = 1; sig <= 32; ++sig) {
+        if (*OriginalMask & (1ULL << (sig - 1))) {
+          sigaddset(&RestoreSet, sig);
+        }
+      }
+      pthread_sigmask(SIG_SETMASK, &RestoreSet, nullptr);
+#else
       ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &OriginalMask, nullptr, sizeof(*OriginalMask));
+#endif
     }
   }
 private:

@@ -9,9 +9,11 @@
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/PrctlUtils.h>
 
+#include <cerrno>
 #include <cstdint>
+#include <unistd.h>
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <sys/prctl.h>
 #endif
 
@@ -19,8 +21,24 @@ namespace FEXCore {
 namespace CPU {
 
   static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  // Every JIT allocation on iOS has to be individually granted execute permission by
+  // StikDebug's external BreakpointJIT mechanism (a slow, page-by-page GDB-remote-mediated
+  // protocol -- see AllocatorHooks.h's iOS section). Confirmed on-device: the initial 16MB
+  // buffer (INITIAL_CODE_SIZE above) allocates fine, but the first *growth* step -- doubling
+  // to 32MB once that fills up, which only a heavier title's larger codebase (Minecraft; a
+  // lighter title never filled the first 16MB buffer at all) ever actually exercised for the
+  // first time this whole port -- crashed inside that external call before it could even
+  // return, never reaching this file's own success/failure logging. Capping growth at the
+  // already-proven-working 16MB (StartLargerCodeBuffer's std::min(latest*2, MAX_CODE_SIZE)
+  // then always returns the same 16MB every time, i.e. growth is disabled rather than
+  // guessing at some other untested larger size) trades more frequent ClearCodeCache
+  // evictions (some re-JIT overhead) for allocations that actually succeed.
+  static constexpr size_t MAX_CODE_SIZE = INITIAL_CODE_SIZE;
+#else
   // We don't want to move above 128MB atm because that means we will have to encode longer jumps
   static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+#endif
 
   constexpr static uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2] = {
     {0x0003'0002'0001'0000ULL, 0x0007'0006'0005'0004ULL}, // NAMED_VECTOR_INCREMENTAL_U16_INDEX
@@ -333,7 +351,29 @@ namespace CPU {
       // Keep a reference to the old code buffer to delay deallocation
       SignalHandlerCodeBuffers.push_back(std::move(CodeBuffer));
     } else {
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+      // Dropping CodeBuffer here (the caller's only remaining reference, since CurrentCodeBuffer
+      // already points at the new buffer) runs its destructor immediately, unmapping the
+      // physical pages -- vs. on other platforms, correctly assuming that once
+      // SignalHandlerRefCounter is 0 nothing else could still reference this buffer. That
+      // assumption doesn't hold here: on iOS every guest thread shares this one
+      // StikDebug-count-limited JIT buffer (see this file's own MAX_CODE_SIZE comment above),
+      // so another thread can be mid-execution of a direct branch into memory this same instant
+      // decides to evict, with no barrier forcing it to have already observed the delink this
+      // eviction just performed (ClearCache/JIT.cpp) before the unmap actually happens.
+      // Confirmed on-device: a crash with exactly that signature (jump to an address the
+      // allocator's own tracking table no longer recognizes at all, "not tracked -- not inside
+      // any currently-live JIT allocation") persisted even after delinking + full cross-thread
+      // cache invalidation were both verified working correctly. Keep a short grace-period
+      // history instead of freeing on the spot -- bounded, so this doesn't grow forever.
+      static constexpr size_t kRetainedBufferCount = 3;
+      SignalHandlerCodeBuffers.push_back(std::move(CodeBuffer));
+      while (SignalHandlerCodeBuffers.size() > kRetainedBufferCount) {
+        SignalHandlerCodeBuffers.erase(SignalHandlerCodeBuffers.begin());
+      }
+#else
       SignalHandlerCodeBuffers.clear();
+#endif
     }
   }
 
@@ -352,15 +392,54 @@ namespace CPU {
 
   CodeBuffer::CodeBuffer(size_t Size)
     : AllocatedSize(Size) {
+#if defined(__APPLE__) && !defined(FEX_APPLE_DUAL_MAPPED_JIT)
+    // Two Darwin MAP_JIT restrictions rule out a trailing guard page here entirely (both
+    // confirmed empirically): (1) mprotect() refuses to change protection on a sub-range of
+    // an existing MAP_JIT mapping (EACCES) -- so the guard can't be carved out of the code
+    // allocation after the fact; (2) mmap() refuses MAP_FIXED combined with MAP_JIT outright
+    // (this build saw errno=1/EPERM, a standalone repro saw EINVAL -- exact errno varies, but
+    // the combination is rejected either way) -- so a separate guard mapping can't be placed
+    // precisely adjacent to a MAP_JIT region either. There's no race-free way left to give
+    // this allocation a trailing guard page on Darwin, so it's simply omitted here: the
+    // Dispatcher's own MAP_JIT buffer (Dispatcher.cpp) already runs with no guard page at
+    // all, so this isn't a new gap in what's actually relied on for correctness, only in
+    // this diagnostic's ability to catch a code-buffer overrun via SIGSEGV.
+    Ptr = static_cast<uint8_t*>(::mmap(nullptr, Size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0));
+    if (Ptr == MAP_FAILED) {
+      // LOGMAN_THROW_A_FMT compiles to a no-op unless ASSERTIONS_ENABLED (confirmed: this
+      // build doesn't have it set, so a silently-failed mmap here would previously have gone
+      // unnoticed until a SIGBUS several frames away during code emission) -- ERROR_AND_DIE_FMT
+      // is unconditional, and a failure here is never recoverable anyway.
+      ERROR_AND_DIE_FMT("Couldn't allocate code buffer: {}", errno);
+    }
+#else
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
-    LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+    // LOGMAN_THROW_A_FMT compiles to a complete no-op ((void)(pred);) unless
+    // ASSERTIONS_ENABLED, which this build doesn't set -- so a failed VirtualAlloc here
+    // previously went entirely unnoticed: no log, no crash, execution just continued with
+    // Ptr == nullptr as the base address of a brand new JIT code buffer, and every guest
+    // instruction subsequently "compiled" into it got written to whatever real memory
+    // happened to sit near address zero (or wherever null-pointer arithmetic landed),
+    // silently corrupting it instead of failing cleanly. Confirmed as a real, reachable
+    // failure mode on-device: on iOS, VirtualAlloc(Execute=true) routes through
+    // iOSJITAlloc(), which depends on StikDebug (an external process) servicing a signal-
+    // trap handshake for every request -- and a captured system log showed StikDebug
+    // getting killed by the OS mid-session for violating a background wake-rate limit,
+    // after which every subsequent request of this kind fails. ERROR_AND_DIE_FMT
+    // (unconditional, matching the macOS branch just above) turns that into an immediate,
+    // attributable failure instead.
+    if (Ptr == nullptr) {
+      ERROR_AND_DIE_FMT("Couldn't allocate code buffer");
+    }
 
-    // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
+    // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
     uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
     if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
                                             FEXCore::Allocator::ProtectOptions::None)) {
       LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
     }
+#endif
 
     FEXCore::Allocator::VirtualName("FEXMemJIT", reinterpret_cast<void*>(Ptr), Size);
 
@@ -437,10 +516,18 @@ namespace CPU {
 
   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
     auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {
+      // Address here is always a live PC -- i.e. the EXECUTABLE side of the buffer -- while
+      // Buffer.Ptr is what VirtualAlloc(..., true) returned, which on iOS is the WRITABLE side
+      // of a genuinely separate dual-mapped alias (see AllocatorHooks.h's iOS section). Translate
+      // before comparing, or this always returns false on iOS regardless of Address, silently
+      // breaking every caller (JIT-vs-non-JIT signal classification, self-modifying-code
+      // tracking, single-step handling) -- identity everywhere else, so harmless there.
+      const uintptr_t BufferExecBase =
+        reinterpret_cast<uintptr_t>(FEXCore::Allocator::GetExecutableAddress(Buffer.Ptr));
       // The last page of the code buffer is protected, so we need to exclude it from the valid range
       // when checking if the address is in the code buffer.
-      uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-      return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr);
+      uintptr_t LastPageAddr = AlignDown(BufferExecBase + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+      return (Address >= BufferExecBase && Address < LastPageAddr);
     };
 
     if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {

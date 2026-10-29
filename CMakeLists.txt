@@ -7,6 +7,11 @@ check_include_files("gdb/jit-reader.h" HAVE_GDB_JIT_READER_H)
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
 option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
+option(BUILD_FEXCORE_ONLY "Build only FEXCore and an embedding smoke executable" OFF)
+option(BUILD_FEXCORE_SMOKE "Build the embedding smoke executable with BUILD_FEXCORE_ONLY" ON)
+set(FEXCORE_SMOKE_SOURCE "" CACHE FILEPATH "Embedding smoke executable source")
+set(FEXCORE_GUEST_HARNESS_SOURCES "" CACHE STRING "Semicolon-separated absolute guest harness sources")
+set(FEXCORE_PROJECT_SOURCE_DIR "" CACHE PATH "Embedding project source directory")
 option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
 option(ENABLE_LTO "Enable LTO with compilation" TRUE)
@@ -61,9 +66,9 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS"))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux and Windows."
+    " FEX only supports Linux, Windows, and (experimentally, AetherCore4) Darwin/iOS."
     " If you believe this is in error, file an issue.")
 endif()
 
@@ -599,7 +604,64 @@ add_subdirectory(External/SoftFloat-3e/)
 add_subdirectory(External/cephes/)
 add_subdirectory(FEXHeaderUtils/)
 add_subdirectory(CodeEmitter/)
-add_subdirectory(FEXCore/)
+if (BUILD_FEXCORE_ONLY)
+  add_subdirectory(FEXCore/ EXCLUDE_FROM_ALL)
+else()
+  add_subdirectory(FEXCore/)
+endif()
+
+if (BUILD_FEXCORE_ONLY)
+  add_subdirectory(Source/Common/ EXCLUDE_FROM_ALL)
+  add_subdirectory(Source/Tools/CommonTools/ EXCLUDE_FROM_ALL)
+  if (BUILD_FEXCORE_SMOKE)
+    if (NOT IS_ABSOLUTE "${FEXCORE_SMOKE_SOURCE}")
+      message(FATAL_ERROR "FEXCORE_SMOKE_SOURCE must be an absolute path")
+    endif()
+    add_executable(fexcore-smoke "${FEXCORE_SMOKE_SOURCE}")
+    target_compile_features(fexcore-smoke PRIVATE cxx_std_20)
+    target_include_directories(fexcore-smoke PRIVATE
+      "${CMAKE_BINARY_DIR}/generated"
+      "${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools")
+    target_link_libraries(fexcore-smoke PRIVATE
+      FEXCore Common CommonTools JemallocLibs ${PTHREAD_LIB})
+    if (FEXCORE_GUEST_HARNESS_SOURCES)
+      if (NOT IS_ABSOLUTE "${FEXCORE_PROJECT_SOURCE_DIR}" OR NOT IS_DIRECTORY "${FEXCORE_PROJECT_SOURCE_DIR}")
+        message(FATAL_ERROR "FEXCORE_PROJECT_SOURCE_DIR must be an absolute source directory")
+      endif()
+      foreach(source IN LISTS FEXCORE_GUEST_HARNESS_SOURCES)
+        if (NOT IS_ABSOLUTE "${source}")
+          message(FATAL_ERROR "fexcore-guest-harness source must be absolute: ${source}")
+        endif()
+      endforeach()
+      add_executable(fexcore-guest-harness ${FEXCORE_GUEST_HARNESS_SOURCES})
+      target_compile_features(fexcore-guest-harness PRIVATE cxx_std_20)
+      target_include_directories(fexcore-guest-harness PRIVATE
+        "${FEXCORE_PROJECT_SOURCE_DIR}"
+        "${CMAKE_BINARY_DIR}/generated"
+        "${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools")
+      target_link_libraries(fexcore-guest-harness PRIVATE
+        FEXCore Common CommonTools JemallocLibs ${PTHREAD_LIB})
+      install(TARGETS fexcore-smoke fexcore-guest-harness RUNTIME DESTINATION bin)
+    else()
+      install(TARGETS fexcore-smoke RUNTIME DESTINATION bin)
+    endif()
+  endif()
+  if (FEXCORE_ASM_TESTS_SOURCE AND FEXCORE_ASM_TESTS_JSON_INCLUDE_DIR)
+    if (NOT IS_ABSOLUTE "${FEXCORE_ASM_TESTS_SOURCE}")
+      message(FATAL_ERROR "FEXCORE_ASM_TESTS_SOURCE must be an absolute path")
+    endif()
+    add_executable(fexcore-asm-tests "${FEXCORE_ASM_TESTS_SOURCE}")
+    target_compile_features(fexcore-asm-tests PRIVATE cxx_std_20)
+    target_include_directories(fexcore-asm-tests PRIVATE
+      "${CMAKE_BINARY_DIR}/generated"
+      "${CMAKE_SOURCE_DIR}/Source/Tools/CommonTools"
+      "${FEXCORE_ASM_TESTS_JSON_INCLUDE_DIR}")
+    target_link_libraries(fexcore-asm-tests PRIVATE
+      FEXCore Common CommonTools JemallocLibs ${PTHREAD_LIB})
+    install(TARGETS fexcore-asm-tests RUNTIME DESTINATION bin)
+  endif()
+  return()
+endif()
 
 if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
   # Binfmt_misc files must be installed prior to Source/ installs

@@ -11,7 +11,12 @@
 #include <cstddef>
 #include <memory_resource>
 namespace fex_pmr = std::pmr;
+// Unused in this file (no PAGE_SIZE/struct user reference below -- FEXCore::Utils::FEX_PAGE_SIZE
+// is used instead throughout). Present on macOS's SDK but not iOS's, unlike Allocator.cpp's own
+// sys/mman.h-adjacent include of this same header, which already excludes __APPLE__ entirely.
+#ifndef __APPLE__
 #include <sys/user.h>
+#endif
 
 #include <mutex>
 

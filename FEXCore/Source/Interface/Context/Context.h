@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -223,9 +224,102 @@ public:
     return CodeInvalidationMutex;
   }
 
+  // ClearCodeCache's NewCodeBuffer=false path (physically reusing an already-granted JIT
+  // buffer in place, an iOS-only workaround for StikDebug's external BreakpointJIT mechanism
+  // failing on a session's 3rd+ fresh-allocation request) clears the calling thread's own L1/L2
+  // lookup caches and the shared L3 cache/block-links, but has no visibility into any *other*
+  // guest thread's independent L1/L2 cache -- those are owned per-thread by application-level
+  // code above this file (AetherPS4::Fex::GuestEngine, which tracks every live
+  // InternalThreadState), not by anything FEXCore's own core keeps a list of. A stale L1/L2 hit
+  // on another thread bypasses CodeInvalidationMutex and CompileBlock entirely (fast-path
+  // lookups only ever consult L1/L2, per this file's "backends only check L1 and L2, not L3"
+  // invariant) and branches straight into now-reused, differently-contented memory -- confirmed
+  // on-device as a distinct fault signature from every other issue fixed today ("not tracked --
+  // not inside any currently-live JIT allocation" -- i.e. genuinely wrong content at a
+  // still-valid-looking address, not an alias mixup). Set by GuestEngine at setup so
+  // ClearCodeCache can invoke it (passing the calling thread so its already-cleared cache isn't
+  // redundantly touched) instead of leaving other threads' caches to only self-correct on their
+  // own next CompileBlock call, which may never come if a thread is mostly just executing
+  // already-cached code.
+  //
+  // The lk parameter is the SAME write-lock token ClearCodeCache already holds (from
+  // Thread->LookupCache->AcquireWriteLock() just above the call site) -- pass it straight
+  // through rather than having the callback acquire anything new. On iOS every guest thread's
+  // LookupCache::Shared points at the one process-wide L3 cache tied to the single, StikDebug-
+  // count-limited JIT buffer (see JIT.cpp's ThreadState->LookupCache->Shared assignment), so
+  // "another thread's write lock" and "the lock we're already holding" are literally the same
+  // mutex, not independent per-thread locks. An earlier version of this callback tried to
+  // (re-)acquire that same lock per other-thread, which can only ever self-conflict: blocking
+  // acquisition deadlocked outright, and a try-lock fallback failed 100% of the time, every
+  // thread, every call, with zero real contention involved -- confirmed on-device.
+  std::function<void(FEXCore::Core::InternalThreadState* CallingThread, const FEXCore::LookupCacheWriteLockToken& lk)>
+    OnBufferReusedInPlace;
+
+  // Safepoint hooks around JIT buffer invalidation. Confirmed on-device: OnBufferReusedInPlace
+  // above (and the delinking GuestToHostMap::ClearCache already does) closes the "another
+  // thread's stale L1/L2 entry" and "another thread's stale direct branch" gaps, but neither
+  // stops a thread that's already MID-EXECUTION of an already-resolved direct branch, right as
+  // the memory it jumps into gets cleared/reused out from under it -- "a thread running
+  // already-JIT'd code never touches CodeInvalidationMutex at all", so holding it exclusively
+  // during a reuse does not, on its own, block a concurrent executor the way it blocks a
+  // concurrent compiler. Seen on-device as two different guest threads both faulting into the
+  // same stale dispatcher region within microseconds of each other, right as a third thread's
+  // buffer-reuse was in flight, once Rocket League reached genuine multi-threaded rendering.
+  //
+  // BeginBufferInvalidationSafepoint should pause every other live guest thread (via an async
+  // signal to each, unrelated to anything guest-visible) and only return once they're
+  // confirmed paused (or a bounded wait times out) -- called right before ANY code memory a
+  // stale branch could be executing through gets touched. EndBufferInvalidationSafepoint
+  // releases them, called once that memory is safe to run through again. Set by GuestEngine at
+  // setup, same as OnBufferReusedInPlace, since it's the one place a full thread list (with
+  // native OS thread handles) exists at all.
+  //
+  // "Safe to run through again" is stricter than it first looks: a thread paused mid-block
+  // (not at a link site) keeps executing forward through whatever bytes are physically at its
+  // resume PC once released, and those bytes are still the *original* ones right up until
+  // something actually overwrites them -- ClearCodeCache's NewCodeBuffer=false path (Core.cpp)
+  // only clears metadata (LookupCache/BlockLinks), it never itself touches the buffer's bytes.
+  // The caller that goes on to physically repopulate that buffer (JIT.cpp's CompileCode, via its
+  // post-clear memcpy) is therefore the one that must hold this pause open -- calling Begin
+  // before ClearCodeCache(..., false) and End only after that memcpy finishes, not just around
+  // the clear itself. Ending it too early was confirmed on-device to still let a just-resumed
+  // thread race that memcpy into the exact bytes it was already executing.
+  //
+  // Ordering relative to CodeInvalidationMutex matters too, and it's the opposite of what seems
+  // natural: the caller must acquire that mutex exclusively *before* calling Begin, not after.
+  // BeginBufferInvalidationSafepoint's pause signal can land on another guest thread at any point
+  // in its execution, including mid-way through CompileBlock or ExitFunctionLink while that thread
+  // holds this same mutex *shared* -- a signal handler can't run that thread's own unlock, so it
+  // stays frozen holding the shared reference for as long as the pause lasts. If the pausing
+  // thread then tries to acquire the mutex exclusively *after* pausing everyone, it can deadlock
+  // against exactly the thread it just froze mid-hold: confirmed on-device as a
+  // "BACHATA_BUFFER_REUSE: begin" with no matching completion ever following it, the session
+  // stuck indefinitely with zero further progress despite the safepoint's own accounting showing
+  // every other thread successfully paused. Acquiring the mutex first avoids this by construction
+  // -- a successful exclusive acquire already proves (via ordinary mutex semantics) that no thread
+  // currently holds it shared, so pausing everyone afterward can never catch one mid-hold of it.
+  std::function<void(FEXCore::Core::InternalThreadState* CallingThread)> BeginBufferInvalidationSafepoint;
+  std::function<void(FEXCore::Core::InternalThreadState* CallingThread)> EndBufferInvalidationSafepoint;
+
+  // Owned by GuestEngine (fex_guest_engine.cpp), set at the same setup point as the two members
+  // just above. Points at a process-wide std::atomic<uint64_t> incremented once per completed
+  // reuse-in-place cycle -- see JITPointers::ReuseGenerationCounterAddress and
+  // CpuStateFrame::ExitFunctionLinkValidatedGeneration for what this closes: the safepoint
+  // mechanism above protects every thread it successfully pauses *before* a reuse starts, but
+  // signal delivery has real, nonzero latency, and a thread whose own trip through
+  // ExitFunctionLinker's post-call window (Dispatcher.cpp) happens to finish faster than that
+  // latency can execute a stale branch before ever being signaled at all -- confirmed on-device
+  // as the actual remaining source of the reuse-in-place crash even with that redirect already
+  // in place. This generation counter is the fallback for exactly that gap: a live, lock-free
+  // check ExitFunctionLinker performs itself, right before trusting the value ExitFunctionLink
+  // (JIT.cpp) handed back, rather than relying solely on having been paused in time.
+  std::atomic<uint64_t>* ReuseGenerationCounter = nullptr;
+
   void ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) override;
 
   bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const override;
+  bool DumpDispatcherStateForDiagnostics(FEXCore::Core::InternalThreadState* Thread, char* OutBuf,
+                                         size_t OutBufSize) const override;
 
   // returns false if a handler was already registered
   std::optional<CustomIRResult>

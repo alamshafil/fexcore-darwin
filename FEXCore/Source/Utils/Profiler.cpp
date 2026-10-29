@@ -2,9 +2,13 @@
 #include <cstdint>
 #include <fcntl.h>
 #ifndef _WIN32
-#include <linux/magic.h>
 #include <sys/stat.h>
+#ifndef __APPLE__
+// Neither linux/magic.h nor sys/vfs.h are actually used anywhere in this file (verified) --
+// no Darwin equivalent needed, just don't include them there.
+#include <linux/magic.h>
 #include <sys/vfs.h>
+#endif
 #endif
 
 #include <FEXCore/Utils/LogManager.h>

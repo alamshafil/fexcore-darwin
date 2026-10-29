@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MIT
 #ifdef ENABLE_FEX_ALLOCATOR
 #include <rpmalloc/rpmalloc.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <sys/prctl.h>
+#include <sys/mman.h>
+#elif defined(__APPLE__)
+// Relative path, not <FEXCore/Utils/PrctlUtils.h> -- the JemallocLibs CMake target that also
+// compiles this file doesn't have FEXCore/include on its search path the way FEXCore_object
+// does, and this is the one Darwin-only include this file needs from there.
+#include "../../include/FEXCore/Utils/PrctlUtils.h"
 #include <sys/mman.h>
 #else
 #define NTDDI_VERSION 0x0A000005
@@ -11,7 +17,11 @@
 #endif
 
 #include <cstdint>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -109,8 +119,11 @@ static void* FEX_rp_mmap(size_t size, size_t alignment, size_t* offset, size_t* 
 #endif
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, map_size, global_config.page_name);
 
-    // Disable HUGEPAGE on allocation from rpmalloc.
+    // Disable HUGEPAGE on allocation from rpmalloc. No Darwin equivalent (its VM manages
+    // superpages automatically, no per-mapping opt-out) -- pure performance hint, safe to skip.
+#ifndef __APPLE__
     madvise(ptr, map_size, MADV_NOHUGEPAGE);
+#endif
   }
 
   if (ptr == nullptr) {
@@ -188,10 +201,24 @@ void* calloc(size_t n, size_t size) {
   return ::calloc(n, size);
 }
 void* memalign(size_t align, size_t s) {
+#ifdef __APPLE__
+  // Darwin's libc doesn't declare memalign() at all (glibc-only extension) -- posix_memalign
+  // covers the same alignment-guarantee, just via an out-parameter instead of a return value.
+  void* ptr {};
+  return ::posix_memalign(&ptr, align, s) == 0 ? ptr : nullptr;
+#else
   return ::memalign(align, s);
+#endif
 }
 void* valloc(size_t size) {
+#ifdef __APPLE__
+  // Darwin's libc doesn't declare valloc() either -- it's defined as page-aligned allocation,
+  // same as memalign(pagesize, size).
+  void* ptr {};
+  return ::posix_memalign(&ptr, static_cast<size_t>(::getpagesize()), size) == 0 ? ptr : nullptr;
+#else
   return ::valloc(size);
+#endif
 }
 int posix_memalign(void** r, size_t a, size_t s) {
   return ::posix_memalign(r, a, s);
@@ -203,7 +230,13 @@ void free(void* ptr) {
   return ::free(ptr);
 }
 size_t malloc_usable_size(void* ptr) {
+#ifdef __APPLE__
+  // Darwin's equivalent of glibc's malloc_usable_size() is malloc_size() (same semantics,
+  // different name), from <malloc/malloc.h>.
+  return ::malloc_size(ptr);
+#else
   return ::malloc_usable_size(ptr);
+#endif
 }
 void* aligned_alloc(size_t a, size_t s) {
   return ::aligned_alloc(a, s);

@@ -666,4 +666,7 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
                        uint64_t MIDR);
 FEXCore::HostFeatures FetchHostFeatures();
 FEX::CPUFeatures GetCPUFeaturesFromIDRegisters();
+#ifdef __APPLE__
+FEX::CPUFeatures GetCPUFeaturesFromDarwinSysctl();
+#endif
 } // namespace FEX

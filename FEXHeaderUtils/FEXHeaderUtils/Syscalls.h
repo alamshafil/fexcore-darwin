@@ -7,10 +7,13 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <syscall.h>
-#else
+#elif defined(_WIN32)
 #include <processthreadsapi.h>
+#endif
+#ifdef __APPLE__
+#include <pthread.h>
 #endif
 #include <sys/stat.h>
 #include <unistd.h>
@@ -51,7 +54,52 @@ namespace FHU::Syscalls {
 #define SYS_pidfd_open 434
 #endif
 
-#ifndef _WIN32
+#ifdef __APPLE__
+// Only getcpu() and gettid() are actually used anywhere within the FEXCore-only (non-Linux-
+// syscall-emulation-layer) build: getcpu() for a plausible-looking CPUID leaf during guest
+// CPUID emulation (doesn't need to be live-accurate, same as this file's own Windows fallback
+// below which always reports node 0), and gettid() purely for a debug JIT-symbol-naming
+// string. tgkill/statx/renameat2/pidfd_open have no callers in this build configuration --
+// stubbed the same "unsupported" way this file's own Windows branch already stubs tgkill.
+inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
+  // Darwin doesn't expose which logical CPU a thread is currently running on via any stable
+  // public API (by design, for scheduler opacity) -- 0 is a safe, always-valid placeholder,
+  // matching how this file's own Windows branch always reports node 0 below.
+  if (cpu) {
+    *cpu = 0;
+  }
+  if (node) {
+    *node = 0;
+  }
+  return 0;
+}
+
+inline int32_t gettid() {
+  uint64_t Tid {};
+  pthread_threadid_np(nullptr, &Tid);
+  return static_cast<int32_t>(Tid);
+}
+
+inline int32_t tgkill(pid_t tgid, pid_t tid, int sig) {
+  ERROR_AND_DIE_FMT("Unsupported");
+  return 0;
+}
+
+inline int32_t statx(int dirfd, const char* pathname, int32_t flags, uint32_t mask, void* statxbuf) {
+  ERROR_AND_DIE_FMT("Unsupported");
+  return -1;
+}
+
+inline int32_t renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags) {
+  ERROR_AND_DIE_FMT("Unsupported");
+  return -1;
+}
+
+inline int32_t pidfd_open(pid_t pid, unsigned int flags) {
+  ERROR_AND_DIE_FMT("Unsupported");
+  return -1;
+}
+#elif !defined(_WIN32)
 inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
   // Third argument is unused
 #if defined(HAS_SYSCALL_GETCPU) && HAS_SYSCALL_GETCPU

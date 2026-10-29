@@ -372,6 +372,10 @@ struct OpHandlers<IR::OP_F64SINCOS> {
 #ifdef _WIN32
     sin = ::sin(src);
     cos = ::cos(src);
+#elif defined(__APPLE__)
+    // Darwin's libm spells this __sincos, not sincos -- same signature, available since
+    // OSX 10.9 (confirmed in <math.h>).
+    __sincos(src, &sin, &cos);
 #else
     sincos(src, &sin, &cos);
 #endif

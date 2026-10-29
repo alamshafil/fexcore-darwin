@@ -27,6 +27,20 @@
 #include <span>
 #include <xxhash.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#include <libkern/OSCacheControl.h>
+#if !TARGET_OS_IPHONE
+// iOS's SDK hard-blocks mach_vm.h (#error mach_vm.h unsupported.) -- not a portability gap,
+// a deliberate platform restriction. FinalizeCodePages()'s use of it below is part of the
+// persistent disk code-cache feature only (an optional load/save-JIT'd-code acceleration, not
+// required for JIT compilation/execution itself), so this is scoped out for iOS below rather
+// than reimplemented; see FinalizeCodePages' own __APPLE__/TARGET_OS_IPHONE split.
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+#endif
+
 #include <FEXCore/Utils/AllocatorHooks.h>
 
 #include <fstream>
@@ -404,6 +418,13 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
     if (!ValidationCTX->InitCore()) {
       ERROR_AND_DIE_FMT("Failed to create cache load validation context");
     }
+    // ValidationCTX->InitCore() just called SignalDelegation->SetConfig() with the addresses
+    // of ITS OWN, separate Dispatcher/JIT buffer -- but SignalDelegation (set a few lines up)
+    // is the *same* SignalDelegator instance the real, currently-running context uses. Left
+    // as-is, any signal later delivered to a live guest thread would get resumed using PC
+    // values belonging to this validation context's buffer instead of the real one's. Restore
+    // the real context's own config immediately.
+    CTX.SignalDelegation->SetConfig(CTX.Dispatcher->MakeSignalDelegatorConfig());
 
     ValidationThread.reset(ValidationCTX->CreateThread(0, 0, nullptr));
 
@@ -844,7 +865,15 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 
   FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
 
-#ifndef _WIN32
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  // The persistent disk code cache isn't supported on iOS: iOS's SDK hard-blocks mach_vm.h
+  // entirely (a deliberate platform restriction, not a portability gap), and the whole
+  // remap-onto-a-PROT_NONE-placeholder scheme below relies on it. This is an optional
+  // load/save-JIT'd-code acceleration feature, not required for JIT compilation/execution
+  // itself -- ERROR_AND_DIE_FMT (ends the process) rather than silently misbehaving if this
+  // ever gets reached, which requires the feature to be enabled elsewhere first.
+  ERROR_AND_DIE_FMT("{}: the persistent disk code cache isn't supported on iOS", __FUNCTION__);
+#elif !defined(_WIN32)
   // Atomicity is critical when making the finalized code data visible.
   // We ensure this by remapping a temporary buffer onto the PROT_NONE
   // placeholder page in CodeBuffer. Some constraints to keep in mind are:
@@ -859,7 +888,16 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
   // Due to (2), a third buffer is temporarily allocated here and freed on
   // completion. The final code data is computed here and then the memory
   // is remapped onto CodeBuffer.
+#ifdef __APPLE__
+  // Darwin's mach_vm_remap refuses to remap any mapping that includes PROT_EXEC at all
+  // (confirmed empirically: KERN_PROTECTION_FAILURE, independent of MAP_JIT), unlike Linux's
+  // mremap which just carries the source mapping's protection across. So Staging is allocated
+  // RW-only here (not Execute=true) -- the exec bit gets added to the *destination* separately
+  // after the remap below, via a plain mprotect(), which is also proven to work.
+  auto* Staging = reinterpret_cast<std::byte*>(Allocator::VirtualAlloc(nullptr, Size, false));
+#else
   auto* Staging = reinterpret_cast<std::byte*>(Allocator::VirtualAlloc(nullptr, Size, true));
+#endif
   if (!Staging) {
     ERROR_AND_DIE_FMT("Failed to allocate {} bytes of staging memory for code-cache finalization", Size);
   }
@@ -879,10 +917,36 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
   // buffer onto the requested CodeBuffer window. MREMAP_DONTUNMAP is used to
   // leave the old VA range reserved so that we can cleanly deallocate it
   // through Allocator.
+#ifdef __APPLE__
+  // Proven independently (see PORTING.md progress log) with a standalone test that: (1) the
+  // content swap is atomic and lands at the exact fixed destination address via
+  // VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE with copy=FALSE (aliases the same pages, doesn't copy
+  // -- matches Linux's MREMAP_MAYMOVE, and leaves Staging's own mapping alone afterward, which
+  // is exactly the MREMAP_DONTUNMAP behavior this code relies on for its own explicit
+  // VirtualFree(Staging) below); (2) a subsequent plain mprotect() to add PROT_EXEC on the
+  // destination works and produces genuinely executable memory; (3) this whole sequence needs
+  // no MAP_JIT/pthread_jit_write_protect_np involvement at all, since we're aliasing fresh
+  // pages into place rather than toggling protection on memory in-place.
+  mach_vm_address_t TargetAddr = reinterpret_cast<mach_vm_address_t>(CodeRange.data());
+  vm_prot_t CurProt = 0, MaxProt = 0;
+  kern_return_t Kr = mach_vm_remap(mach_task_self(), &TargetAddr, Size, /*mask=*/0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                    mach_task_self(), reinterpret_cast<mach_vm_address_t>(Staging),
+                                    /*copy=*/FALSE, &CurProt, &MaxProt, VM_INHERIT_DEFAULT);
+  if (Kr != KERN_SUCCESS || TargetAddr != reinterpret_cast<mach_vm_address_t>(CodeRange.data())) {
+    ERROR_AND_DIE_FMT("{}: mach_vm_remap failed: {}", __FUNCTION__, Kr);
+  }
+  if (::mprotect(CodeRange.data(), Size, PROT_READ | PROT_EXEC) != 0) {
+    ERROR_AND_DIE_FMT("{}: mprotect(PROT_READ|PROT_EXEC) failed: {}", __FUNCTION__, errno);
+  }
+  // I$/D$ aren't coherent on ARM64 after writing new code through the data path (the memcpy
+  // and relocations above) -- required before this code range is safe to execute.
+  sys_icache_invalidate(CodeRange.data(), Size);
+#else
   void* RemapResult = ::mremap(Staging, Size, Size, MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP, CodeRange.data());
   if (RemapResult == MAP_FAILED) {
     ERROR_AND_DIE_FMT("{}: mremap failed: {}", __FUNCTION__, errno);
   }
+#endif
   Allocator::VirtualFree(Staging, Size);
 
   // Release resident file pages that will no longer be needed. The VA range is left allocated to allow cleanup with a single VirtualFree.

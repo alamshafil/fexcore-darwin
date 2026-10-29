@@ -55,9 +55,35 @@ public:
   }
 #endif
 
-  uint64_t GetExitFunctionLinkerAddress() const {
-    return ExitFunctionLinkerAddress;
-  }
+  // Defined in Dispatcher.cpp (not inline here) since it needs FEXCore::Allocator's
+  // GetExecutableAddress, which AllocatorHooks.h isn't included in this header. This value
+  // gets embedded as an absolute literal into every compiled guest block (see
+  // Arm64Relocations.cpp's SYMBOL_LITERAL_EXITFUNCTION_LINKER) and later branched to as the
+  // block-linking exit stub, so on iOS it must be the executable (RX) address like every
+  // other escaping absolute pointer here -- ExitFunctionLinkerAddress itself is the raw
+  // write-side value captured via GetCursorAddress() during EmitDispatcher().
+  uint64_t GetExitFunctionLinkerAddress() const;
+
+  // Crash-diagnostic only: the dispatcher's own known-good, already-RX-translated entry
+  // addresses, for direct comparison against whatever is actually stored in a live thread's
+  // CpuStateFrame::Pointers at the moment of a crash (see BachataDumpDispatcherState in
+  // fex_guest_engine.cpp). DispatchPtr is the dispatcher's function entry point (its very
+  // first emitted byte); DispatcherLoopTopAddress is a separate label further into the same
+  // generated code, past the prologue -- these are two genuinely different addresses by
+  // construction (confirmed: ~0xa0 bytes apart in EmitDispatcher, matching AbsoluteLoopTop's
+  // Bind() coming after several prologue instructions), not two copies of the same value.
+  // Compare each live Pointers field against its OWN matching field here, never against
+  // DispatchPtr for anything but Pointers.DispatchPtr itself -- an earlier version of this
+  // comparison did exactly that (Live.DispatcherLoopTop vs Known.DispatchPtr) and reported a
+  // permanent, meaningless "MISMATCH" on every single run, real corruption or not.
+  struct DiagnosticAddresses {
+    uint64_t DispatchPtr;
+    uint64_t Start;
+    uint64_t End;
+    uint64_t ExitFunctionLinkerAddress;
+    uint64_t DispatcherLoopTopAddress;
+  };
+  DiagnosticAddresses GetDiagnosticAddresses() const;
 
   SignalDelegatorConfig MakeSignalDelegatorConfig() const;
 
@@ -76,12 +102,16 @@ private:
   uint64_t ThreadStopHandlerAddress {};
   uint64_t ThreadStopHandlerAddressSpillSRA {};
   uint64_t AbsoluteLoopTopAddress {};
+  // See JITPointers::DispatcherBlockLookupRangeEnd (CoreState.h) for what this bounds.
+  uint64_t DispatcherBlockLookupRangeEndAddress {};
   uint64_t AbsoluteLoopTopAddressFillSRA {};
   uint64_t AbsoluteLoopTopAddressEnterEC {};
   uint64_t AbsoluteLoopTopAddressEnterECFillSRA {};
   uint64_t ThreadPauseHandlerAddress {};
   uint64_t ThreadPauseHandlerAddressSpillSRA {};
   uint64_t ExitFunctionLinkerAddress {};
+  // See JITPointers::DispatcherBlockLookupRangeEnd (CoreState.h) for what this bounds.
+  uint64_t ExitFunctionLinkerRangeEndAddress {};
   uint64_t SignalHandlerReturnAddress {};
   uint64_t SignalHandlerReturnAddressRT {};
   uint64_t GuestSignal_SIGILL {};

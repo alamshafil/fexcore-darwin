@@ -160,6 +160,23 @@ public:
   FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const = 0;
 
   /**
+   * @brief Crash-diagnostic only: writes a human-readable dump of the dispatcher's own
+   * known-good entry addresses alongside what the given thread's live CpuStateFrame::Pointers
+   * actually holds for the same fields, flagging any mismatches. Added for the iOS port to
+   * pin down a dual-mapped-JIT (RW vs RX) address-translation bug: a mismatch here means a
+   * corrupted/stale/never-updated per-thread pointer, whereas a match with the *fault*
+   * address itself would point at a dispatcher-level translation gap instead.
+   *
+   * @param Thread Which thread's Pointers to dump and compare.
+   * @param OutBuf Destination buffer; always null-terminated if OutBufSize > 0.
+   * @param OutBufSize Size of OutBuf.
+   *
+   * @return true if the dump was written (false if Thread/OutBuf are invalid).
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool DumpDispatcherStateForDiagnostics(FEXCore::Core::InternalThreadState* Thread, char* OutBuf,
+                                                                        size_t OutBufSize) const = 0;
+
+  /**
    * @brief Informs the context if hardware TSO is supported.
    * Once hardware TSO is enabled, then TSO emulation through atomics is disabled and relies on the hardware.
    *

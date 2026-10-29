@@ -9,7 +9,11 @@
 #ifdef _WIN32
 #include <thread>
 #else
+#ifdef __APPLE__
+#include <limits.h> // PATH_MAX -- POSIX-standard, not linux/limits.h here
+#else
 #include <linux/limits.h>
+#endif
 #endif
 
 namespace FEX::CPUInfo {

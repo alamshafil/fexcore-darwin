@@ -3,7 +3,9 @@
 #include <atomic>
 #include <cstdint>
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
+#elif !defined(_WIN32)
 #include <linux/futex.h> /* Definition of FUTEX_* constants */
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <unistd.h>
@@ -270,7 +272,31 @@ public:
 
 private:
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+  // Darwin's os_sync_wait_on_address family is explicitly documented by Apple as "Darwin's
+  // futex style APIs" -- compare-and-wait / wake-by-address, the same fundamental primitive.
+  // One real gap versus Linux's FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET: there's no bitset filter
+  // to selectively wake only the writer-waiters or only the reader-waiters sharing this one
+  // Futex word. Waking the unfiltered set is still *correct* (never a hang or a lost wakeup) --
+  // every wait loop in this class already re-checks the atomic state and tolerates spurious
+  // wakeups by design (see the "Can get some spurious wake-ups" comment in lock_shared()) --
+  // just occasionally less efficient than Linux's selective wake.
+  void FutexWaitForWriteAvailable(uint32_t Expected) {
+    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+  }
+
+  void FutexWaitForReadAvailable(uint32_t Expected) {
+    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+  }
+
+  void FutexWakeWriter() {
+    os_sync_wake_by_address_any(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  }
+
+  void FutexWakeReaders() {
+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  }
+#elif !defined(_WIN32)
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAIT_BITSET, Expected, nullptr, nullptr, FUTEX_BITSET_WAIT_WRITERS);
   }

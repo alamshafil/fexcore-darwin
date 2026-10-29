@@ -12,6 +12,7 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/memory_resource.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stddef.h>
 #include <utility>
@@ -25,12 +26,21 @@ protected:
 };
 
 struct LookupCacheWriteLockToken : public LookupCacheBaseLockToken {
+  // Whether this token actually holds the lock -- only meaningful for a token constructed via
+  // the try_to_lock overload below (see GuestToHostMap::TryAcquireWriteLock's own comment for
+  // why that path exists). A token from the plain (blocking) constructor always owns the lock.
+  [[nodiscard]] bool Owned() const {
+    return Lock.owns_lock();
+  }
+
 private:
   // Only constructible by GuestToHostMap
   friend struct GuestToHostMap;
   LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
     : Lock {Mutex} {}
-  std::lock_guard<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
+  LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex, std::try_to_lock_t)
+    : Lock {Mutex, std::try_to_lock} {}
+  std::unique_lock<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
 };
 
 struct LookupCacheReadLockToken : public LookupCacheBaseLockToken {
@@ -48,6 +58,22 @@ struct GuestToHostMap {
   [[nodiscard]]
   LookupCacheWriteLockToken AcquireWriteLock() {
     return LookupCacheWriteLockToken {Lock};
+  }
+
+  // Non-blocking variant: check LookupCacheWriteLockToken::Owned() on the result before using
+  // it. Exists for cross-thread cache invalidation (a thread reusing the shared JIT buffer in
+  // place, clearing sibling threads' caches -- see OnBufferReusedInPlace's own comment,
+  // Context.h) where blocking here risks a real deadlock: the calling thread already holds
+  // CodeInvalidationMutex exclusively at that point, and if the target thread is itself
+  // waiting on that same mutex (e.g. mid-compile, about to take it shared) while holding this
+  // very lock, the blocking AcquireWriteLock() above would wait forever on a lock its own
+  // holder can never release. Confirmed on-device: exactly this scenario hung Minecraft's
+  // boot indefinitely with zero further progress. Skipping a thread here just leaves its L1/L2
+  // stale for one more compile cycle -- the same (already-handled) class of fault as a
+  // still-tracked-but-stale address, not a hang.
+  [[nodiscard]]
+  LookupCacheWriteLockToken TryAcquireWriteLock() {
+    return LookupCacheWriteLockToken {Lock, std::try_to_lock};
   }
 
   [[nodiscard]]
@@ -202,9 +228,19 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
+            // Data before tag, with a compiler barrier holding that order: this L1 slot is read
+            // lock-free (FindBlock's "no lock needed" L1 check, above) and this same thread can be
+            // interrupted by a signal between these two stores. Tag-then-data (the order this used
+            // to be written in) lets an interrupting reentrant lookup observe GuestCode already
+            // matching Address while HostCode still holds this slot's previous (possibly stale/
+            // freed, hash-collision-unrelated) occupant -- a torn read that looks fully valid to
+            // FindBlock's caller. Confirmed on-device: ExitFunctionLink returning a HostCode for
+            // GuestRip=0x70007b9cf0 that pointed completely outside every current code buffer,
+            // for a GuestRip that had resolved correctly moments earlier in the same session.
+            HostPtr = BlockPointers[PageOffset].HostCode;
+            L1Entry.HostCode = HostPtr;
+            std::atomic_signal_fence(std::memory_order_seq_cst);
             L1Entry.GuestCode = Address;
-            L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
-            HostPtr = L1Entry.HostCode;
           }
         }
       }
@@ -379,6 +415,12 @@ public:
     return Shared->AcquireWriteLock();
   }
 
+  // See GuestToHostMap::TryAcquireWriteLock's own comment for why this non-blocking variant
+  // exists. Check LookupCacheWriteLockToken::Owned() on the result before using it.
+  auto TryAcquireWriteLock() {
+    return Shared->TryAcquireWriteLock();
+  }
+
 private:
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
     for (const auto& CodePage : Entry.CodePages) {
@@ -387,8 +429,11 @@ private:
 
     // Do L1
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    L1Entry.GuestCode = Address;
+    // Data before tag -- see the matching comment in FindBlock's L2-promotion write above for why
+    // this order (and the fence holding it) is required, not just style.
     L1Entry.HostCode = Entry.HostCode;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    L1Entry.GuestCode = Address;
 
     if (!DisableL2Cache() && !L1Only) {
       // Do ful map

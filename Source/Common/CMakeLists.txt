@@ -12,8 +12,18 @@ set(SRCS
 
 if (NOT MINGW)
   list(APPEND SRCS
+    FileFormatCheck.cpp)
+endif()
+
+if (NOT MINGW AND NOT APPLE)
+  # FEXServerClient.cpp: async IPC client for the out-of-process FEXServer daemon
+  # (Linux epoll/ppoll-based reactor, no Darwin port -- and nothing in the
+  # FEXCORE_ONLY scope talks to FEXServer, only the full FEXServer/FEXInterpreter/
+  # TestHarnessRunner/Steam tools do, none of which are built here).
+  # Linux/SBRKAllocations.cpp: sbrk()-based allocation tracking, Linux-specific
+  # (MAP_FIXED_NOREPLACE has no Darwin equivalent), same no-consumer-in-scope story.
+  list(APPEND SRCS
     FEXServerClient.cpp
-    FileFormatCheck.cpp
     Linux/SBRKAllocations.cpp)
 endif()
 

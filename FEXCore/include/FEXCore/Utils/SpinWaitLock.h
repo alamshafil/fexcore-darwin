@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <mutex>
 #include <type_traits>
 
@@ -128,6 +129,22 @@ static inline uint64_t WFELoadAtomic(uint64_t* Futex) {
 
   return Result;
 }
+
+#ifdef __APPLE__
+// Darwin's LP64 ABI defines uint64_t as `unsigned long long`, while size_t (and `unsigned
+// long`) is a distinct type from it despite being the same 64-bit width -- unlike glibc, where
+// they commonly alias to the same `unsigned long` typedef, so this overload gap never appears
+// there. Call sites that pass a size_t* (e.g. CodeCache.cpp's WaitPred<..., size_t>) need a
+// matching overload; delegating to the uint64_t implementation is exact and safe since the two
+// types have identical representation on any 64-bit platform, just different names.
+static inline size_t LoadExclusive(size_t* Futex) {
+  return static_cast<size_t>(LoadExclusive(reinterpret_cast<uint64_t*>(Futex)));
+}
+
+static inline size_t WFELoadAtomic(size_t* Futex) {
+  return static_cast<size_t>(WFELoadAtomic(reinterpret_cast<uint64_t*>(Futex)));
+}
+#endif
 
 template<typename Pred, typename T>
 static inline void WaitPred(T* Futex, T ComparisonValue) {

@@ -2,6 +2,7 @@
 #include "Utils/Allocator/HostAllocator.h"
 #include "Utils/Allocator.h"
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -23,7 +24,30 @@
 #include <fcntl.h>
 #ifndef _WIN32
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <sys/user.h>
+#endif
+#endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+#include <atomic>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <map>
+#include <mutex>
+#include <unistd.h>
+#include <utility>
+#endif
+#endif
+
+#ifndef MADV_DONTDUMP
+// No Darwin equivalent (core-dump exclusion works differently there, via a separate
+// mechanism, not a per-mapping madvise hint). The caller already treats an unsupported advice
+// value as a soft failure (madvise() returns -1, feature gets disabled), so any placeholder
+// value here is safe -- it never needs to actually do anything on this platform.
+#define MADV_DONTDUMP 16
 #endif
 
 namespace fextl::pmr {
@@ -319,5 +343,237 @@ void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
   VirtualTHPControl = Ptrs.VirtualTHPControl;
 }
 
+#endif
+
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+// iOS JIT allocation: no MAP_JIT-equivalent is available to a sideloaded/free-provisioned
+// app, so executable memory instead comes from an externally-attached StikDebug session
+// servicing the same BRK #0xf00d protocol as src/core/ios/ios_jit_allocator.cpp in the
+// embedding app (Bachata-S4). Duplicated here rather than shared, since FEXCore-Darwin builds
+// as its own standalone static library with no dependency on Bachata-S4's own Core::
+// namespace.
+//
+// Ground truth, confirmed on-device the hard way (read from StikDebug's own source,
+// github.com/StikDebug/StikDebug, plus two rounds of on-device crash evidence):
+// BreakGetJITMapping(addr, len) has two branches. addr != nullptr grants execute permission on
+// the caller's own pre-existing address in place -- the call returns successfully, but the
+// memory never actually becomes executable (confirmed via raw GDB-remote wire capture: the
+// grant call completes, yet every subsequent branch into that memory faults, forever, with zero
+// memory-write packets ever sent for it). addr == nullptr instead makes the debugger allocate a
+// brand-new region itself (GDB-remote "_M<len>,rx") before granting it execute permission --
+// that memory genuinely IS executable, but it is NOT writable from this process's own store
+// instructions (confirmed via crash log: a plain write to the returned address SIGSEGVs from
+// ordinary host C++ code, nowhere near guest execution -- the "rx" in "_M<len>,rx" turns out to
+// be literal). So a real dual-mapped scheme is required: get the executable address from the
+// addr == nullptr branch, then locally `mach_vm_remap` a second, writable virtual alias of
+// those same physical pages -- remapping within one's own task needs no debugger help or
+// special entitlement, only the execute side did. This matches the pattern Ryujinx/AetherX's
+// DualMappedJitAllocator uses against the same protocol, and this codebase's own
+// shader-recompiler JIT (src/core/ios/ios_jit_allocator.cpp) uses the identical scheme.
+namespace {
+using BreakGetJITMappingFn = void* (*)(void*, size_t);
+using BreakJITDetachFn = void (*)();
+
+struct BreakpointJITSymbols {
+  BreakGetJITMappingFn get_jit_mapping = nullptr;
+  BreakJITDetachFn jit_detach = nullptr;
+};
+
+#if !TARGET_OS_IPHONE
+// Mac harness of the phone (FEX_MAC_PHONE_PATH): the process maps anonymous read+execute pages
+// itself, standing in for StikDebug's fresh-allocation branch; iOSJITAlloc then makes the
+// writable alias with vm_remap exactly as on the phone. A MAP_JIT region would not do: it
+// cannot be vm_remap'd, and the phone has no MAP_JIT either.
+void* MacGetJITMapping(void* Addr, size_t Len) {
+  if (Addr != nullptr) {
+    return nullptr;
+  }
+  void* RX = ::mmap(nullptr, Len, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+  return RX == MAP_FAILED ? nullptr : RX;
+}
+void MacJITDetach() {}
+#endif
+
+const BreakpointJITSymbols& GetBreakpointJITSymbols() noexcept {
+#if !TARGET_OS_IPHONE
+  static const BreakpointJITSymbols MacSymbols {MacGetJITMapping, MacJITDetach};
+  return MacSymbols;
+#endif
+  static const BreakpointJITSymbols symbols = [] {
+    BreakpointJITSymbols s;
+    void* handle =
+      dlopen("@executable_path/Frameworks/BreakpointJIT.framework/BreakpointJIT", RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+      return s;
+    }
+    s.get_jit_mapping = reinterpret_cast<BreakGetJITMappingFn>(dlsym(handle, "BreakGetJITMapping"));
+    s.jit_detach = reinterpret_cast<BreakJITDetachFn>(dlsym(handle, "BreakJITDetach"));
+    return s;
+  }();
+  return symbols;
+}
+
+// One dual-mapped allocation: WriteBase is the mach_vm_remap'd writable alias, ExecBase is the
+// address BreakGetJITMapping actually granted -- two different addresses backed by the same
+// physical pages. Tracked both ways (keyed by base address -> {other side's base, size}) so
+// GetExecutableAddress/GetWritableAddress can translate in either direction, and so an address
+// *within* a region (not just its exact base) can still be classified/translated correctly.
+// std::map (not unordered_map) specifically so upper_bound gives an ordered range lookup.
+struct MappedRegion {
+  uintptr_t OtherBase;
+  size_t Size;
+};
+
+struct JITMappingTable {
+  std::mutex Mutex;
+  std::map<uintptr_t, MappedRegion> WriteToExec;
+  std::map<uintptr_t, MappedRegion> ExecToWrite;
+};
+
+JITMappingTable& GetJITMappingTable() {
+  static JITMappingTable Table;
+  return Table;
+}
+
+// Caller must hold Table.Mutex. Returns Addr translated to the other side of the mapping it
+// falls within, offset-preserving, or Addr unchanged if it isn't inside any tracked region
+// (defensive fallback only -- every Execute=true allocation on iOS goes through iOSJITAlloc, so
+// in practice every real call here should hit).
+void* TranslateAddressLocked(const std::map<uintptr_t, MappedRegion>& Table, void* Addr) {
+  if (Addr == nullptr) {
+    return nullptr;
+  }
+  const auto A = reinterpret_cast<uintptr_t>(Addr);
+  auto It = Table.upper_bound(A);
+  if (It == Table.begin()) {
+    return Addr;
+  }
+  --It;
+  const auto& [Base, Region] = *It;
+  if (A >= Base && A < Base + Region.Size) {
+    return reinterpret_cast<void*>(Region.OtherBase + (A - Base));
+  }
+  return Addr;
+}
+} // namespace
+
+void* GetExecutableAddress(void* WriteAddr) {
+  auto& Table = GetJITMappingTable();
+  std::lock_guard<std::mutex> Lock(Table.Mutex);
+  return TranslateAddressLocked(Table.WriteToExec, WriteAddr);
+}
+
+void* GetWritableAddress(void* ExecAddr) {
+  auto& Table = GetJITMappingTable();
+  std::lock_guard<std::mutex> Lock(Table.Mutex);
+  return TranslateAddressLocked(Table.ExecToWrite, ExecAddr);
+}
+
+// Counts every BreakGetJITMapping call made through iOSJITAlloc, in order, so a crash log can
+// be correlated against exactly how many prior requests StikDebug had already serviced --
+// distinguishing "dies after N requests" from "flaky from the start" from "always the very
+// first one". Deliberately logged for every call, not just failures: a silent server-side
+// failure to actually grant execute permission looks identical to success from here (see this
+// file's top comment), so the request/response timeline itself is the only signal available
+// short of StikDebug's own logs.
+std::atomic<uint64_t> AllocationCounter{0};
+
+void* iOSJITAlloc(size_t Size) {
+  const uint64_t RequestNumber = AllocationCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto& Symbols = GetBreakpointJITSymbols();
+  if (Symbols.get_jit_mapping == nullptr) {
+    LogMan::Msg::EFmt("iOSJITAlloc #{}: BreakpointJIT symbols unavailable", RequestNumber);
+    return nullptr;
+  }
+
+  LogMan::Msg::IFmt("iOSJITAlloc #{}: requesting fresh execute-capable region (size={})",
+                    RequestNumber, Size);
+  void* ExecAddr = Symbols.get_jit_mapping(nullptr, Size);
+  if (ExecAddr == nullptr) {
+    LogMan::Msg::EFmt("iOSJITAlloc #{}: BreakGetJITMapping(nullptr, {}) returned nullptr -- StikDebug "
+                      "with the Universal JIT Script must be attached before this point, or its "
+                      "session has stopped responding.",
+                      RequestNumber, Size);
+    return nullptr;
+  }
+  LogMan::Msg::IFmt("iOSJITAlloc #{}: BreakGetJITMapping returned {} (execute-side)", RequestNumber,
+                    ExecAddr);
+
+  // Remap a second, writable virtual alias of the SAME physical pages, purely locally -- see
+  // this file's top comment for why this half doesn't need the debugger at all. mach_vm.h's
+  // 64-bit-explicit API (mach_vm_remap et al.) isn't available on iOS ("mach_vm.h unsupported"
+  // from the SDK itself) -- vm_map.h's classic API works the same way here since vm_address_t
+  // is pointer-width on 64-bit Darwin.
+  vm_address_t WriteAddr = 0;
+  vm_prot_t CurProt = VM_PROT_NONE, MaxProt = VM_PROT_NONE;
+  kern_return_t Kr = vm_remap(mach_task_self(), &WriteAddr, static_cast<vm_size_t>(Size), /*mask=*/0,
+                               VM_FLAGS_ANYWHERE, mach_task_self(), reinterpret_cast<vm_address_t>(ExecAddr),
+                               /*copy=*/FALSE, &CurProt, &MaxProt, VM_INHERIT_NONE);
+  if (Kr != KERN_SUCCESS) {
+    LogMan::Msg::EFmt("iOSJITAlloc #{}: vm_remap failed for execute-side {} (size={}): "
+                      "kern_return_t {} ({})",
+                      RequestNumber, ExecAddr, Size, static_cast<int>(Kr), mach_error_string(Kr));
+    return nullptr;
+  }
+  Kr = vm_protect(mach_task_self(), WriteAddr, static_cast<vm_size_t>(Size), /*set_maximum=*/FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE);
+  if (Kr != KERN_SUCCESS) {
+    LogMan::Msg::EFmt("iOSJITAlloc #{}: vm_protect(RW) failed for remapped {} (size={}): "
+                      "kern_return_t {} ({})",
+                      RequestNumber, reinterpret_cast<void*>(WriteAddr), Size, static_cast<int>(Kr),
+                      mach_error_string(Kr));
+    vm_deallocate(mach_task_self(), WriteAddr, static_cast<vm_size_t>(Size));
+    return nullptr;
+  }
+  LogMan::Msg::IFmt("iOSJITAlloc #{}: remapped writable alias {} (execute-side {})", RequestNumber,
+                    reinterpret_cast<void*>(WriteAddr), ExecAddr);
+
+  auto& Table = GetJITMappingTable();
+  std::lock_guard<std::mutex> Lock(Table.Mutex);
+  Table.WriteToExec[static_cast<uintptr_t>(WriteAddr)] = MappedRegion{reinterpret_cast<uintptr_t>(ExecAddr), Size};
+  Table.ExecToWrite[reinterpret_cast<uintptr_t>(ExecAddr)] = MappedRegion{static_cast<uintptr_t>(WriteAddr), Size};
+  return reinterpret_cast<void*>(WriteAddr);
+}
+
+bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size) {
+  auto& Table = GetJITMappingTable();
+  std::lock_guard<std::mutex> Lock(Table.Mutex);
+  const auto It = Table.WriteToExec.find(reinterpret_cast<uintptr_t>(WriteAddr));
+  if (It == Table.WriteToExec.end()) {
+    return false;
+  }
+  const auto ExecBase = It->second.OtherBase;
+  Table.WriteToExec.erase(It);
+  Table.ExecToWrite.erase(ExecBase);
+  vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(WriteAddr), static_cast<vm_size_t>(Size));
+  vm_deallocate(mach_task_self(), static_cast<vm_address_t>(ExecBase), static_cast<vm_size_t>(Size));
+  return true;
+}
+
+// Crash-diagnostic only: classifies an arbitrary host address against the live-allocation
+// tables (checking both the write-side and execute-side, since a fault address could land on
+// either) so a SIGSEGV/SIGBUS handler can log what it actually was, rather than just its raw
+// bytes.
+iOSJITAddressKind iOSJITDescribeAddress(void* Addr, uintptr_t* OutRegionBase, size_t* OutOffset, size_t* OutSize) {
+  auto& Table = GetJITMappingTable();
+  std::lock_guard<std::mutex> Lock(Table.Mutex);
+  const auto A = reinterpret_cast<uintptr_t>(Addr);
+
+  for (const auto* Side : {&Table.WriteToExec, &Table.ExecToWrite}) {
+    auto It = Side->upper_bound(A);
+    if (It == Side->begin()) {
+      continue;
+    }
+    --It;
+    const auto& [Base, Region] = *It;
+    if (A >= Base && A < Base + Region.Size) {
+      if (OutRegionBase) *OutRegionBase = Base;
+      if (OutOffset) *OutOffset = A - Base;
+      if (OutSize) *OutSize = Region.Size;
+      return iOSJITAddressKind::LiveAllocation;
+    }
+  }
+  return iOSJITAddressKind::NotTracked;
+}
 #endif
 } // namespace FEXCore::Allocator

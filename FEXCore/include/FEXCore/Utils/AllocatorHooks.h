@@ -6,8 +6,24 @@
 
 #ifndef _WIN32
 #include <stdlib.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <TargetConditionals.h>
+// FEX_APPLE_DUAL_MAPPED_JIT: executable memory is a dual-mapped RW/RX pair (see the iOS section
+// below). True on iOS, and on macOS when FEXCore is built for the Mac harness of the phone
+// (-DFEX_MAC_PHONE_PATH=1), where the execute side comes from the process itself instead of
+// StikDebug. Every TU that includes this header must agree on FEX_MAC_PHONE_PATH: the embedding
+// app has to pass the same definition that FEXCore was built with.
+#if TARGET_OS_IPHONE || defined(FEX_MAC_PHONE_PATH)
+#define FEX_APPLE_DUAL_MAPPED_JIT 1
+#endif
+#endif
 #else
 #define NTDDI_VERSION 0x0A000005
 #include <memoryapi.h>
@@ -113,15 +129,149 @@ FEX_DEFAULT_VISIBILITY extern void VirtualName(const char* Name, void* Ptr, size
 
 // All commit parameters are ignored here, they are unnecessary as Linux supports overcommit
 
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+// iOS has no MAP_JIT-equivalent available to a sideloaded/free-provisioned app (no
+// dynamic-codesigning entitlement). Executable allocations here instead go through Bachata's
+// StikDebug BreakpointJIT protocol (see iOSJITAlloc/iOSJITFreeIfOwned below, implemented in
+// Allocator.cpp).
+//
+// Ground truth, confirmed on-device the hard way: BreakGetJITMapping's two branches are each
+// broken in a complementary way for a single-address model. Requesting a grant on an address
+// this process already owns (addr != nullptr) returns success but the memory never actually
+// becomes executable (confirmed via raw GDB-remote wire capture -- the call completes, yet
+// every subsequent branch into that memory faults, forever). Requesting a fresh allocation
+// (addr == nullptr) DOES return real executable memory, but that memory is not writable from
+// this process's own store instructions (confirmed via crash log: a plain write to the
+// returned address SIGSEGVs from ordinary host C++ code, nowhere near guest execution). So a
+// real dual-mapped scheme is required after all: get the executable address from
+// BreakGetJITMapping(nullptr, ...), then locally `mach_vm_remap` a second, writable virtual
+// alias of those same physical pages (no debugger involvement needed for that half -- remapping
+// within one's own task is an ordinary VM operation). This matches the pattern
+// Ryujinx/AetherX's DualMappedJitAllocator uses against the same protocol. GetExecutableAddress/
+// GetWritableAddress below translate between the two sides via the table iOSJITAlloc populates.
+// No special mmap flag is needed, so this stays 0 rather than MAP_JIT.
+constexpr int PlatformExecuteFlag = 0;
+
+// Returns the WRITABLE address of a fresh dual-mapped JIT region (write code through this
+// pointer; use GetExecutableAddress() on it to get the address to branch/call into).
+void* iOSJITAlloc(size_t Size);
+// Returns true (and fully handles the free, both mappings) if WriteAddr is a tracked JIT
+// allocation; returns false and does nothing otherwise, leaving the caller to fall through to
+// an ordinary munmap.
+bool iOSJITFreeIfOwned(void* WriteAddr, size_t Size);
+
+// Real translation on iOS (unlike the identity definitions used by every other platform below):
+// looks up WriteAddr/ExecAddr in the table iOSJITAlloc populates and returns the corresponding
+// address on the other side of the mapping, offset-preserving (so an address partway into a
+// region, e.g. a cursor mid-buffer, translates correctly, not just exact region bases). Falls
+// back to identity for anything not tracked (defensive only -- every Execute=true allocation on
+// iOS goes through iOSJITAlloc, so in practice every real call here should hit).
+void* GetExecutableAddress(void* WriteAddr);
+void* GetWritableAddress(void* ExecAddr);
+
+enum class iOSJITAddressKind {
+  NotTracked, // Not inside any currently-live JIT allocation.
+  LiveAllocation,
+};
+// Crash-diagnostic only -- see Allocator.cpp's definition for what each result means.
+iOSJITAddressKind iOSJITDescribeAddress(void* Addr, uintptr_t* OutRegionBase, size_t* OutOffset, size_t* OutSize);
+
+// On iOS the RW half of a dual-mapped allocation is ordinary (remapped) memory -- always
+// writable, no per-thread W^X state to toggle (that's a MAP_JIT-specific concept; see the
+// macOS branch below). Writes go straight through the RW address at all times, so this guard
+// is a no-op here.
+class ScopedJITWriteProtect final {
+public:
+  ScopedJITWriteProtect() = default;
+  ScopedJITWriteProtect(const ScopedJITWriteProtect&) = delete;
+  ScopedJITWriteProtect& operator=(const ScopedJITWriteProtect&) = delete;
+};
+#elif defined(__APPLE__)
+// Apple Silicon rejects PROT_EXEC on a plain mmap outright (EACCES) -- confirmed empirically.
+// Any executable allocation must carry MAP_JIT, and writing to it afterward requires each
+// writing thread to toggle pthread_jit_write_protect_np(0) first (per-thread W^X state, not
+// per-mapping) -- that part is the caller's responsibility, VirtualAlloc can't do it on their
+// behalf since callers write incrementally over time (e.g. a JIT emitter), not via one call
+// here.
+constexpr int PlatformExecuteFlag = MAP_JIT;
+
+// RAII guard for the per-thread MAP_JIT write-protect toggle. Confirmed empirically that
+// `memory region` can report a page as "rwx" while it still SIGBUS/faults on execution --
+// vmmap's permission bits reflect the mapping's ceiling, not this thread's *current* W^X
+// side (write-enabled+non-executable, or execute-enabled+non-writable, never both at once
+// on a MAP_JIT page). Construct this around any span of code that writes JIT'd bytes into
+// an Execute=true VirtualAlloc allocation; its destructor flips back to execute-enabled
+// before the writing thread can fall through to running what it just emitted. Safe across
+// FEXCore's setjmp-based JIT compile-restart path (CompileCode's UncheckedLongJump) since a
+// longjmp back to a setjmp checkpoint *within* the same stack frame never runs destructors
+// for locals constructed before that checkpoint -- only an actual `return` (or exception)
+// unwinds this guard, which is exactly the "compilation attempt is over" boundary we want.
+class ScopedJITWriteProtect final {
+public:
+  ScopedJITWriteProtect() {
+    pthread_jit_write_protect_np(0);
+  }
+  ScopedJITWriteProtect(const ScopedJITWriteProtect&) = delete;
+  ScopedJITWriteProtect& operator=(const ScopedJITWriteProtect&) = delete;
+  ~ScopedJITWriteProtect() {
+    pthread_jit_write_protect_np(1);
+  }
+};
+#else
+constexpr int PlatformExecuteFlag = 0;
+#endif
+
+#if !defined(FEX_APPLE_DUAL_MAPPED_JIT)
+// Identity on every platform except iOS, which has a real dual-mapped RW/RX split -- see this
+// file's iOS section above, which declares real (non-identity) versions of both functions
+// instead of these. Kept as a named function (rather than removing every call site) so a
+// JIT-buffer address that escapes as a branch target or C function pointer -- e.g. Dispatcher's
+// DispatchPtr, or a compiled block's entry point before it goes into the lookup cache -- stays
+// visibly marked as such at the call site on platforms where it's currently a no-op too.
+inline void* GetExecutableAddress(void* WriteAddr) {
+  return WriteAddr;
+}
+
+// See GetExecutableAddress.
+inline void* GetWritableAddress(void* ExecAddr) {
+  return ExecAddr;
+}
+#endif
+
 inline void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true) {
-  return FEXCore::Allocator::mmap(nullptr, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  // A plain executable mmap is rejected outright on iOS too (EACCES), same as macOS, just
+  // without a MAP_JIT to reach for -- this must never fall through to the mmap below.
+  if (Execute) {
+    return iOSJITAlloc(Size);
+  }
+#endif
+  return FEXCore::Allocator::mmap(nullptr, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0),
+                                   MAP_PRIVATE | MAP_ANONYMOUS | (Execute ? PlatformExecuteFlag : 0), -1, 0);
 }
 
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
-  return FEXCore::Allocator::mmap(Base, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  if (Execute) {
+    // None of this build's Execute=true callers pass a real fixed Base (verified: all either
+    // omit it or pass nullptr) -- MAP_FIXED was never requested by the mmap call below either,
+    // so Base was always just a hint. Safe to ignore here the same way.
+    return iOSJITAlloc(Size);
+  }
+#endif
+  return FEXCore::Allocator::mmap(Base, Size, PROT_READ | PROT_WRITE | (Execute ? PROT_EXEC : 0),
+                                   MAP_PRIVATE | MAP_ANONYMOUS | (Execute ? PlatformExecuteFlag : 0), -1, 0);
 }
 
 inline void VirtualFree(void* Ptr, size_t Size) {
+#if defined(FEX_APPLE_DUAL_MAPPED_JIT)
+  // iOSJITFree recognizes and fully handles (munmaps) its own RW allocations, returning false
+  // for anything else so the caller falls through to the ordinary munmap below -- callers here
+  // don't track which VirtualAlloc path an address originally came from.
+  if (iOSJITFreeIfOwned(Ptr, Size)) {
+    return;
+  }
+#endif
   FEXCore::Allocator::munmap(Ptr, Size);
 }
 inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
@@ -143,7 +293,16 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 }
 
 inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) {
+#ifdef __APPLE__
+  // Darwin's VM system manages superpages automatically; there's no per-mapping madvise hint
+  // to request/decline them the way Linux's transparent-huge-pages MADV_HUGEPAGE/NOHUGEPAGE
+  // does. This is purely a performance hint either way, safe to no-op.
+  (void)Ptr;
+  (void)Size;
+  (void)Control;
+#else
   ::madvise(const_cast<void*>(Ptr), Size, Control == THPControl::Enable ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+#endif
 }
 
 #endif

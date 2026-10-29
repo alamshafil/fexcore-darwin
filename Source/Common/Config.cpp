@@ -17,7 +17,11 @@
 #include <fmt/format.h>
 #include <functional>
 #ifndef _WIN32
+#ifdef __APPLE__
+#include <limits.h> // PATH_MAX -- POSIX-standard, not linux/limits.h here
+#else
 #include <linux/limits.h>
+#endif
 #include <pwd.h>
 #endif
 #include <optional>
