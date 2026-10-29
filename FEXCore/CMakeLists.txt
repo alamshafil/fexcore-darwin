@@ -45,6 +45,6 @@ if (NOT BUILD_STEAM_SUPPORT)
     COMPONENT Development)
 endif()
 
-if (BUILD_TESTING)
+if (FEX_BUILD_TESTS)
   add_subdirectory(unittests/)
 endif()

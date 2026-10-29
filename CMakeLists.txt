@@ -91,7 +91,10 @@ else ()
 endif()
 
 ## Architecture Handling ##
-string(TOLOWER ${CMAKE_SYSTEM_PROCESSOR} processor)
+if (NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_OSX_ARCHITECTURES)
+  set(CMAKE_SYSTEM_PROCESSOR "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" processor)
 if (processor MATCHES "x86|amd64")
   option(ENABLE_X86_HOST_DEBUG "Enables compiling on x86_64 host" FALSE)
   if (NOT ENABLE_X86_HOST_DEBUG)
@@ -375,7 +378,14 @@ if (NOT unordered_dense_FOUND)
 endif()
 
 include(CTest)
-if (BUILD_TESTING OR ENABLE_VIXL_DISASSEMBLER OR ENABLE_VIXL_SIMULATOR)
+# Only build internal FEX tests when building standalone FEX
+if (BUILD_TESTING AND CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+  set(FEX_BUILD_TESTS TRUE)
+else()
+  set(FEX_BUILD_TESTS FALSE)
+endif()
+
+if (FEX_BUILD_TESTS OR ENABLE_VIXL_DISASSEMBLER OR ENABLE_VIXL_SIMULATOR)
   add_subdirectory(External/vixl/)
 endif()
 
@@ -415,7 +425,7 @@ endif()
 add_compile_options(-Wno-trigraphs)
 add_compile_definitions(GLOBAL_DATA_DIRECTORY="${DATA_DIRECTORY}/")
 
-if (BUILD_TESTING)
+if (FEX_BUILD_TESTS)
   find_package(Catch2 3 QUIET)
   if (NOT Catch2_FOUND)
     add_subdirectory(External/Catch2/)
@@ -590,7 +600,7 @@ endif()
 
 add_compile_options(-Wall)
 
-if (BUILD_TESTING)
+if (FEX_BUILD_TESTS)
   message(STATUS "Unit tests are enabled")
 
   set(TEST_JOB_COUNT "" CACHE STRING "Override number of parallel jobs to use while running tests")
@@ -686,7 +696,7 @@ foreach(CONFIG_SRC ${CONFIG_SOURCES})
     COMPONENT Runtime)
 endforeach()
 
-if (BUILD_TESTING)
+if (FEX_BUILD_TESTS)
   add_subdirectory(unittests/)
 endif()
 

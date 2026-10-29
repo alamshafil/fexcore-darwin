@@ -273,7 +273,12 @@ function(AddObject Name)
 endfunction()
 
 function(AddLibrary Name Type)
-  add_library(${Name} ${Type} $<TARGET_OBJECTS:${PROJECT_NAME}_object>)
+  set(EXTRA_SRCS)
+  if (CMAKE_GENERATOR MATCHES "Xcode")
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fex_xcode_dummy_${Name}.cpp" CONTENT "// Xcode dummy\n")
+    set(EXTRA_SRCS "${CMAKE_CURRENT_BINARY_DIR}/fex_xcode_dummy_${Name}.cpp")
+  endif()
+  add_library(${Name} ${Type} $<TARGET_OBJECTS:${PROJECT_NAME}_object> ${EXTRA_SRCS})
   set_target_properties(${Name} PROPERTIES OUTPUT_NAME FEXCore)
 
   # During generation of the import library (dll.a), MinGW needs some extra symbols from libraries
