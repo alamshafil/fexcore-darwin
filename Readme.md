@@ -1,3 +1,5 @@
+> **Fork notice:** this is the macOS/iOS (Darwin ARM64) fork of FEX. Fork-specific README changes are in [README.fork.md](README.fork.md).
+
 [中文](https://github.com/FEX-Emu/FEX/blob/main/docs/Readme_CN.md)
 # FEX: Emulate x86 Programs on ARM64
 FEX allows you to run x86 applications on ARM64 Linux devices, similar to qemu-user and box64.
