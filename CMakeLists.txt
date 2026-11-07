@@ -66,9 +66,9 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR ANDROID))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux, Windows, and (experimentally, AetherCore4) Darwin/iOS."
+    " FEX only supports Linux, Android, Windows, and (experimentally) Darwin/iOS."
     " If you believe this is in error, file an issue.")
 endif()
 
@@ -82,6 +82,9 @@ elseif (MINGW)
   message(STATUS "Building for MinGW")
   set(ENABLE_FEX_ALLOCATOR TRUE)
   set(ENABLE_JEMALLOC_GLIBC_ALLOC FALSE)
+elseif (ANDROID)
+  message(STATUS "Building for Android")
+  add_compile_definitions(_LIBCPP_ENABLE_EXPERIMENTAL)
 else ()
   message(STATUS "Clang version ${CMAKE_CXX_COMPILER_VERSION}")
   set(CLANG_MINIMUM_VERSION 13.0)
@@ -502,6 +505,11 @@ if (NOT TUNE_ARCH STREQUAL "generic")
   else()
     message(FATAL_ERROR "Trying to compile arch type '${TUNE_ARCH}' but the compiler doesn't support this")
   endif()
+endif()
+
+if (ANDROID)
+  # -mcpu=native cannot be probed on a cross build and big.LITTLE cores differ.
+  set(TUNE_CPU "none")
 endif()
 
 if (TUNE_CPU STREQUAL "native")

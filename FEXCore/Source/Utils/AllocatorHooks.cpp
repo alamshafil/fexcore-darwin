@@ -211,8 +211,8 @@ void* memalign(size_t align, size_t s) {
 #endif
 }
 void* valloc(size_t size) {
-#ifdef __APPLE__
-  // Darwin's libc doesn't declare valloc() either -- it's defined as page-aligned allocation,
+#if defined(__APPLE__) || defined(__ANDROID__)
+  // Darwin's (and Bionic's) libc doesn't declare valloc() either -- it's defined as page-aligned allocation,
   // same as memalign(pagesize, size).
   void* ptr {};
   return ::posix_memalign(&ptr, static_cast<size_t>(::getpagesize()), size) == 0 ? ptr : nullptr;
