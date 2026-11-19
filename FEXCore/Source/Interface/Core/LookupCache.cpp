@@ -143,7 +143,9 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
     Delinker(Tag.HostLink);
   }
 
-  // Allocate a new pointer from the BlockLinks pma again.
+  // Release old links and recreate fresh map from the monotonic buffer resource
+  BlockLinks_pma->delete_object(BlockLinks);
+  BlockLinks_mbr.release();
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
   // All code is gone, clear the block list
   BlockList.clear();

@@ -634,8 +634,16 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
 #endif
 
   // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
+  auto* Context = static_cast<Context::ContextImpl*>(Thread->CTX);
+  if (!Context->IsAddressInCodeBuffer(Thread, reinterpret_cast<uintptr_t>(Record))) {
+    return HostCode != 0 ? HostCode : Frame->Pointers.DispatcherLoopTop;
+  }
+
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+  if (!Context->IsAddressInCodeBuffer(Thread, CallerAddress)) {
+    return HostCode != 0 ? HostCode : Frame->Pointers.DispatcherLoopTop;
+  }
   auto BranchOffset = HostCode / 4 - CallerAddress / 4;
 
   uint32_t ExpectedKnownCallMarkerInst = 0;
@@ -1205,7 +1213,6 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     blr(TMP1);
 
     // This is a ExitFunctionLinkData struct
-    BindOrRestart(&l_ExitLink);
     dc64(0);                                                                   // HostCode
     PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(PendingJumpThunk.GuestRIP)); // GuestRIP
     dc64(PendingJumpThunk.CallerAddress - ThunkAddress);                       // CallerOffset

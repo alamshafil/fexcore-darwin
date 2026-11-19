@@ -485,12 +485,28 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
 
   if (!Thread->CallRetStackBase) {
     size_t stack_size = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-    void* CallRetStack = ::mmap(nullptr, stack_size,
-                                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    const size_t guard_size = static_cast<size_t>(::getpagesize());
+    auto try_alloc_guarded = [guard_size](size_t sz, size_t* out_guard) -> void* {
+      void* alloc = ::mmap(nullptr, sz + 2 * guard_size,
+                           PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (alloc == MAP_FAILED) {
+        return MAP_FAILED;
+      }
+      void* usable = reinterpret_cast<uint8_t*>(alloc) + guard_size;
+      if (::mprotect(usable, sz, PROT_READ | PROT_WRITE) != 0) {
+        ::munmap(alloc, sz + 2 * guard_size);
+        return MAP_FAILED;
+      }
+      *out_guard = guard_size;
+      return usable;
+    };
+
+    size_t actual_guard = 0;
+    void* CallRetStack = try_alloc_guarded(stack_size, &actual_guard);
     if (CallRetStack == MAP_FAILED) {
-      size_t fallback_sizes[] = { 128 * 1024, 64 * 1024, 32 * 1024 };
+      size_t fallback_sizes[] = { 256 * 1024, 128 * 1024, 64 * 1024, 32 * 1024 };
       for (size_t sz : fallback_sizes) {
-        CallRetStack = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        CallRetStack = try_alloc_guarded(sz, &actual_guard);
         if (CallRetStack != MAP_FAILED) {
           stack_size = sz;
           break;
@@ -501,10 +517,12 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
       stack_size = 64 * 1024;
       CallRetStack = ::malloc(stack_size);
       Thread->CallRetStackFromHeap = true;
+      actual_guard = 0;
     }
     if (CallRetStack != nullptr && CallRetStack != MAP_FAILED) {
       Thread->CallRetStackBase = CallRetStack;
       Thread->CallRetStackAllocSize = stack_size;
+      Thread->CallRetStackGuardSize = actual_guard;
       Thread->CurrentFrame->State.callret_sp = reinterpret_cast<uint64_t>(CallRetStack) +
                                               (stack_size / 2);
     }
@@ -561,9 +579,12 @@ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
     if (Thread->CallRetStackFromHeap) {
       ::free(Thread->CallRetStackBase);
     } else {
-      ::munmap(Thread->CallRetStackBase, Thread->CallRetStackAllocSize);
+      void* alloc_base = reinterpret_cast<uint8_t*>(Thread->CallRetStackBase) - Thread->CallRetStackGuardSize;
+      size_t alloc_size = Thread->CallRetStackAllocSize + 2 * Thread->CallRetStackGuardSize;
+      ::munmap(alloc_base, alloc_size);
     }
     Thread->CallRetStackBase = nullptr;
+    Thread->CallRetStackGuardSize = 0;
   }
   delete Thread;
 #if defined(__APPLE__)

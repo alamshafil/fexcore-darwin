@@ -13,6 +13,10 @@
 #include <shared_mutex>
 #include <type_traits>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace FEXCore {
 class LookupCache;
 struct JITSymbolBuffer;
@@ -117,8 +121,10 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // (real pages are still committed lazily/on first touch, not up front), a larger reservation
   // costs address space, not RAM proportional to how deep the guest actually nests -- quadrupled
   // for comfortable headroom.
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
   static constexpr size_t CALLRET_STACK_SIZE {0x40000};
+#elif defined(__APPLE__)
+  static constexpr size_t CALLRET_STACK_SIZE {0x400000};
 #else
   static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 #endif
@@ -126,6 +132,7 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // The low address of the call-ret stack allocation (not including guard pages)
   void* CallRetStackBase {};
   size_t CallRetStackAllocSize {CALLRET_STACK_SIZE};
+  size_t CallRetStackGuardSize {};
   bool CallRetStackFromHeap {false};
 
   uintptr_t JITGuardPage {};
