@@ -434,10 +434,17 @@ namespace CPU {
     }
 
     // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
-    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
-                                            FEXCore::Allocator::ProtectOptions::None)) {
-      LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+#if !defined(_WIN32)
+    const size_t GuardPageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#else
+    constexpr size_t GuardPageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+    if (Size > GuardPageSize) {
+      uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, GuardPageSize);
+      if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), GuardPageSize,
+                                              FEXCore::Allocator::ProtectOptions::None)) {
+        LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+      }
     }
 #endif
 

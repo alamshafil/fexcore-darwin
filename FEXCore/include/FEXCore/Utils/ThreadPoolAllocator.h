@@ -16,6 +16,9 @@
 #include <optional>
 #include <type_traits>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 namespace FEXCore::Utils {
 /**
@@ -388,6 +391,17 @@ public:
 private:
   void* Alloc(size_t Size) override {
     auto Result = FEXCore::Allocator::VirtualAlloc(Size);
+    if (Result == nullptr || Result == reinterpret_cast<void*>(static_cast<uintptr_t>(-1))) {
+#ifdef __APPLE__
+      task_vm_info_data_t vm_info {};
+      mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+      if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info), &count) == KERN_SUCCESS) {
+        ERROR_AND_DIE_FMT("PooledAllocatorVirtual: VirtualAlloc(Size={:#x}) failed (errno={}, phys={}MB, virt={}MB)",
+                          Size, errno, vm_info.phys_footprint / (1024 * 1024), vm_info.virtual_size / (1024 * 1024));
+      }
+#endif
+      ERROR_AND_DIE_FMT("PooledAllocatorVirtual: VirtualAlloc(Size={:#x}) failed (errno={})", Size, errno);
+    }
     if (Name) {
       FEXCore::Allocator::VirtualName(Name, Result, Size);
     }
